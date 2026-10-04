@@ -1,6 +1,14 @@
 In development
 ==============
 
+- Add explicit class identity namespaces (`cloudpickle.ClassIdentityNamespace`
+  and `cloudpickle.get_class_identity_namespace`) to isolate the identities
+  of dynamically reconstructed classes, enums and typevars between loading
+  sessions, while preserving instance/class identity within a single load.
+  The `cloudpickle.load`/`loads`/`dump`/`dumps` entry points accept an
+  optional `namespace` argument and keep their historical behavior by
+  default.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

@@ -120,6 +120,45 @@ situations:
 - If a function pickled by reference uses a function pickled by value during its execution.
 
 
+Isolating dynamic class identities with namespaces:
+---------------------------------------------------
+
+By default, all `cloudpickle` loads in a process share a single, global
+identity namespace: loading the same payload twice reuses the same
+reconstructed dynamic class, so that `isinstance` checks keep working across
+loads. When the same dynamic class definition is shipped to two isolated
+tasks, it can be desirable to give each task its own independent class state
+instead. This can be achieved with explicit class identity namespaces:
+
+```python
+>>> import cloudpickle
+>>> payload = cloudpickle.dumps(MyDynamicClass)
+>>> ns_task1 = cloudpickle.ClassIdentityNamespace("task-1")
+>>> ns_task2 = cloudpickle.ClassIdentityNamespace("task-2")
+>>> cls1 = ns_task1.loads(payload)
+>>> cls2 = ns_task2.loads(payload)
+>>> cls1 is cls2
+False
+>>> cls1.some_class_attr = "task-1 state"  # does not affect cls2
+>>> ns_task1.loads(payload) is cls1  # loads within a session are reused
+True
+```
+
+All the instances unpickled within a single load (and, by default, within a
+single namespace) still belong to the same class. Class skeletons, enums,
+typevars, metaclasses and base classes all follow the selected namespace.
+Pass `reuse=False` to `ClassIdentityNamespace` to instead reconstruct fresh
+class definitions on every load within the namespace. Shared named
+namespaces (loading sessions) can be obtained with
+`cloudpickle.get_class_identity_namespace(name)`; they are only weakly
+referenced by the registry and are garbage collected once no longer used.
+
+Note that namespaces provide **identity isolation, not an execution
+sandbox**: unpickling executes the code embedded in the payload with the
+usual privileges of the process, so only ever load pickle data from trusted
+sources.
+
+
 Running the tests
 -----------------
 

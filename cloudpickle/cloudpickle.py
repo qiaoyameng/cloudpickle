@@ -54,6 +54,7 @@ import _collections_abc
 from collections import ChainMap, OrderedDict
 import abc
 import builtins
+import contextlib
 import copyreg
 import dataclasses
 import dis
@@ -90,9 +91,197 @@ _PICKLE_BY_VALUE_MODULES = set()
 # Track the provenance of reconstructed dynamic classes to make it possible to
 # reconstruct instances from the matching singleton class definition when
 # appropriate and preserve the usual "isinstance" semantics of Python objects.
-_DYNAMIC_CLASS_TRACKER_BY_CLASS = weakref.WeakKeyDictionary()
-_DYNAMIC_CLASS_TRACKER_BY_ID = weakref.WeakValueDictionary()
-_DYNAMIC_CLASS_TRACKER_LOCK = threading.Lock()
+#
+# The provenance trackers are scoped to a "class identity namespace":
+# unpickling the same payload in two distinct namespaces yields independent
+# class definitions while all the objects unpickled within a single namespace
+# share the same class definitions. The default namespace is process-global
+# and preserves the historical cloudpickle behavior.
+
+
+class ClassIdentityNamespace:
+    """Isolated identity scope for dynamically reconstructed classes.
+
+    Loading the same pickle payload in two distinct namespaces yields
+    independent class definitions (for dynamic classes, enums, typevars and
+    their inheritance relationships): class-level state such as class
+    attributes can then evolve independently in each namespace, while all
+    the instances loaded within a single namespace (and a single load)
+    still belong to the same class.
+
+    Parameters
+    ----------
+    name: str, optional
+        Human-readable identifier, only used for representation and
+        debugging purposes.
+    reuse: bool, default=True
+        Whether reloading the same payload in this namespace reuses the
+        class definitions reconstructed by previous loads in the same
+        namespace. When False, each load reconstructs fresh class
+        definitions. Identity within a single load is always preserved
+        regardless of this setting.
+
+    Notes
+    -----
+    This is an identity isolation mechanism, not an execution sandbox:
+    unpickling executes the code embedded in the payload with the usual
+    privileges of the current process, regardless of the namespace being
+    used. Only ever load pickle data from trusted sources.
+
+    Namespaces only hold weak references to the classes they track, so
+    tracked classes (and namespaces themselves) can be garbage collected
+    once they are no longer referenced elsewhere.
+    """
+
+    def __init__(self, name=None, *, reuse=True):
+        self.name = name
+        self.reuse = bool(reuse)
+        self._by_class = weakref.WeakKeyDictionary()
+        self._by_id = weakref.WeakValueDictionary()
+        self._lock = threading.Lock()
+
+    def __repr__(self):
+        return f"{type(self).__name__}(name={self.name!r}, reuse={self.reuse!r})"
+
+    def _get_or_create_tracker_id(self, class_def):
+        with self._lock:
+            class_tracker_id = self._by_class.get(class_def)
+            if class_tracker_id is None:
+                class_tracker_id = uuid.uuid4().hex
+                self._by_class[class_def] = class_tracker_id
+                self._by_id[class_tracker_id] = class_def
+        return class_tracker_id
+
+    def _lookup_class_or_track(self, class_tracker_id, class_def):
+        if not self.reuse:
+            # Each load reconstructs fresh class definitions: neither
+            # consult nor populate the tracker. Identity within a single
+            # load is still guaranteed by the unpickler's memo.
+            return class_def
+        with self._lock:
+            class_def = self._by_id.setdefault(class_tracker_id, class_def)
+            self._by_class[class_def] = class_tracker_id
+        return class_def
+
+    def __enter__(self):
+        _push_active_namespace(self)
+        return self
+
+    def __exit__(self, *exc_info):
+        _pop_active_namespace(self)
+        return None
+
+    def load(self, file, **kwargs):
+        """Unpickle an object graph from a file within this namespace."""
+        with self:
+            return pickle.load(file, **kwargs)
+
+    def loads(self, data, **kwargs):
+        """Unpickle an object graph from a bytes object within this namespace."""
+        with self:
+            return pickle.loads(data, **kwargs)
+
+    def dump(self, obj, file, **kwargs):
+        """Pickle obj into a file, scoping tracker lookups to this namespace."""
+        with self:
+            return dump(obj, file, **kwargs)
+
+    def dumps(self, obj, **kwargs):
+        """Pickle obj as bytes, scoping tracker lookups to this namespace."""
+        with self:
+            return dumps(obj, **kwargs)
+
+
+# The default namespace is process-global: it preserves the historical
+# cloudpickle behavior where all loads in a process share the same dynamic
+# class identities.
+_DEFAULT_NAMESPACE = ClassIdentityNamespace(name="cloudpickle-default")
+
+# Backward-compatible aliases to the trackers of the default namespace.
+_DYNAMIC_CLASS_TRACKER_BY_CLASS = _DEFAULT_NAMESPACE._by_class
+_DYNAMIC_CLASS_TRACKER_BY_ID = _DEFAULT_NAMESPACE._by_id
+_DYNAMIC_CLASS_TRACKER_LOCK = _DEFAULT_NAMESPACE._lock
+
+# Thread-local stack of explicitly activated namespaces, so that concurrent
+# loads in different threads can use different namespaces.
+_ACTIVE_NAMESPACE_LOCAL = threading.local()
+
+
+def _get_active_namespace():
+    stack = getattr(_ACTIVE_NAMESPACE_LOCAL, "stack", None)
+    if stack:
+        return stack[-1]
+    return _DEFAULT_NAMESPACE
+
+
+def _push_active_namespace(namespace):
+    stack = getattr(_ACTIVE_NAMESPACE_LOCAL, "stack", None)
+    if stack is None:
+        stack = _ACTIVE_NAMESPACE_LOCAL.stack = []
+    stack.append(namespace)
+
+
+def _pop_active_namespace(namespace):
+    stack = getattr(_ACTIVE_NAMESPACE_LOCAL, "stack", None)
+    if not stack or stack[-1] is not namespace:
+        raise RuntimeError(
+            "Class identity namespace stack is unbalanced: "
+            f"cannot deactivate {namespace!r}"
+        )
+    stack.pop()
+
+
+@contextlib.contextmanager
+def _activate_namespace(namespace):
+    # Activate an explicit namespace for the duration of the context.
+    # ``None`` means "keep the currently active namespace" (which falls
+    # back to the process-global default namespace).
+    if namespace is None:
+        yield
+        return
+    if not isinstance(namespace, ClassIdentityNamespace):
+        raise TypeError(
+            "namespace should be a ClassIdentityNamespace instance or None, "
+            f"got {namespace!r} instead"
+        )
+    _push_active_namespace(namespace)
+    try:
+        yield
+    finally:
+        _pop_active_namespace(namespace)
+
+
+# Registry of named namespaces. Only weak references are held so that a
+# namespace is garbage collected once the code that requested it no longer
+# keeps it alive: named namespaces are loading *sessions*, not permanent
+# process state.
+_CLASS_IDENTITY_NAMESPACE_REGISTRY = weakref.WeakValueDictionary()
+_CLASS_IDENTITY_NAMESPACE_REGISTRY_LOCK = threading.Lock()
+
+
+def get_class_identity_namespace(name, *, reuse=True):
+    """Get the shared class identity namespace registered under ``name``.
+
+    If no live namespace is registered under ``name``, a new one is created
+    with the given ``reuse`` setting and registered. Otherwise the existing
+    namespace is returned and ``reuse`` must match its current setting.
+
+    The registry only holds weak references to namespaces: keep your own
+    reference to the returned namespace for as long as the loading session
+    is meant to stay alive. Once all references are dropped, the namespace
+    and its (weakly held) class identity records are garbage collected.
+    """
+    with _CLASS_IDENTITY_NAMESPACE_REGISTRY_LOCK:
+        namespace = _CLASS_IDENTITY_NAMESPACE_REGISTRY.get(name)
+        if namespace is None:
+            namespace = ClassIdentityNamespace(name=name, reuse=reuse)
+            _CLASS_IDENTITY_NAMESPACE_REGISTRY[name] = namespace
+    if namespace.reuse != reuse:
+        raise ValueError(
+            f"Namespace {name!r} already exists with reuse={namespace.reuse}, "
+            f"which does not match the requested reuse={reuse}"
+        )
+    return namespace
 
 PYPY = platform.python_implementation() == "PyPy"
 
@@ -105,22 +294,14 @@ _extract_code_globals_cache = weakref.WeakKeyDictionary()
 
 
 def _get_or_create_tracker_id(class_def):
-    with _DYNAMIC_CLASS_TRACKER_LOCK:
-        class_tracker_id = _DYNAMIC_CLASS_TRACKER_BY_CLASS.get(class_def)
-        if class_tracker_id is None:
-            class_tracker_id = uuid.uuid4().hex
-            _DYNAMIC_CLASS_TRACKER_BY_CLASS[class_def] = class_tracker_id
-            _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id] = class_def
-    return class_tracker_id
+    return _get_active_namespace()._get_or_create_tracker_id(class_def)
 
 
 def _lookup_class_or_track(class_tracker_id, class_def):
     if class_tracker_id is not None:
-        with _DYNAMIC_CLASS_TRACKER_LOCK:
-            class_def = _DYNAMIC_CLASS_TRACKER_BY_ID.setdefault(
-                class_tracker_id, class_def
-            )
-            _DYNAMIC_CLASS_TRACKER_BY_CLASS[class_def] = class_tracker_id
+        class_def = _get_active_namespace()._lookup_class_or_track(
+            class_tracker_id, class_def
+        )
     return class_def
 
 
@@ -1524,7 +1705,7 @@ class Pickler(pickle.Pickler):
 # Shorthands similar to pickle.dump/pickle.dumps
 
 
-def dump(obj, file, protocol=None, buffer_callback=None):
+def dump(obj, file, protocol=None, buffer_callback=None, *, namespace=None):
     """Serialize obj as bytes streamed into file
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1536,11 +1717,16 @@ def dump(obj, file, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    If namespace is a ClassIdentityNamespace, dynamic class identity tracker
+    lookups performed while pickling are scoped to that namespace instead of
+    the process-global default namespace.
     """
-    Pickler(file, protocol=protocol, buffer_callback=buffer_callback).dump(obj)
+    with _activate_namespace(namespace):
+        Pickler(file, protocol=protocol, buffer_callback=buffer_callback).dump(obj)
 
 
-def dumps(obj, protocol=None, buffer_callback=None):
+def dumps(obj, protocol=None, buffer_callback=None, *, namespace=None):
     """Serialize obj as a string of bytes allocated in memory
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1552,15 +1738,51 @@ def dumps(obj, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    If namespace is a ClassIdentityNamespace, dynamic class identity tracker
+    lookups performed while pickling are scoped to that namespace instead of
+    the process-global default namespace.
     """
-    with io.BytesIO() as file:
-        cp = Pickler(file, protocol=protocol, buffer_callback=buffer_callback)
-        cp.dump(obj)
-        return file.getvalue()
+    with _activate_namespace(namespace):
+        with io.BytesIO() as file:
+            cp = Pickler(file, protocol=protocol, buffer_callback=buffer_callback)
+            cp.dump(obj)
+            return file.getvalue()
 
 
-# Include pickles unloading functions in this namespace for convenience.
-load, loads = pickle.load, pickle.loads
+# Include pickles unloading functions in this namespace for convenience. The
+# optional namespace argument scopes dynamic class identity to an explicit
+# ClassIdentityNamespace; by default the process-global namespace is used,
+# which preserves the historical behavior.
+
+
+def load(file, *, namespace=None, **kwargs):
+    """Unpickle an object graph from a file, optionally within a namespace.
+
+    Extra keyword arguments are forwarded to pickle.load. Loading the same
+    payload in two distinct ClassIdentityNamespace instances yields
+    independent dynamic class definitions, while repeated loads within one
+    namespace share class identities (unless the namespace was created with
+    reuse=False). Note that this is an identity isolation mechanism, not an
+    execution sandbox: only load pickle data from trusted sources.
+    """
+    with _activate_namespace(namespace):
+        return pickle.load(file, **kwargs)
+
+
+def loads(data, *, namespace=None, **kwargs):
+    """Unpickle an object graph from bytes, optionally within a namespace.
+
+    Extra keyword arguments are forwarded to pickle.loads. Loading the same
+    payload in two distinct ClassIdentityNamespace instances yields
+    independent dynamic class definitions, while repeated loads within one
+    namespace share class identities (unless the namespace was created with
+    reuse=False). Note that this is an identity isolation mechanism, not an
+    execution sandbox: only load pickle data from trusted sources.
+    """
+    with _activate_namespace(namespace):
+        return pickle.loads(data, **kwargs)
+
 
 # Backward compat alias.
 CloudPickler = Pickler

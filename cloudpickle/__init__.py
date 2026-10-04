@@ -9,10 +9,12 @@ __all__ = [  # noqa
     "__version__",
     "Pickler",
     "CloudPickler",
+    "ClassIdentityNamespace",
     "dumps",
     "loads",
     "dump",
     "load",
+    "get_class_identity_namespace",
     "register_pickle_by_value",
     "unregister_pickle_by_value",
 ]

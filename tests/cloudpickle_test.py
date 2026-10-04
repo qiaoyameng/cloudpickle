@@ -4,6 +4,7 @@ import collections
 import base64
 import dataclasses
 import functools
+import gc
 import io
 import itertools
 import logging
@@ -2047,6 +2048,245 @@ class CloudPickleTest(unittest.TestCase):
             protocol=self.protocol
         )
         assert_run_python_script(code)
+
+    def test_class_identity_namespace_isolation(self):
+        # Two namespaces loading the same payload get independent class
+        # definitions whose class-level state can evolve independently.
+        class A:
+            """A dynamic class"""
+
+            class_attr = "original"
+
+        payload = cloudpickle.dumps(A(), protocol=self.protocol)
+        ns_a = cloudpickle.ClassIdentityNamespace("task-a")
+        ns_b = cloudpickle.ClassIdentityNamespace("task-b")
+
+        obj_a = ns_a.loads(payload)
+        obj_b = ns_b.loads(payload)
+
+        assert type(obj_a) is not type(obj_b)
+        assert type(obj_a).__doc__ == "A dynamic class"
+
+        # Mutating the class state in one namespace does not leak into the
+        # other namespace.
+        type(obj_a).class_attr = "modified"
+        assert obj_a.class_attr == "modified"
+        assert obj_b.class_attr == "original"
+
+        # isinstance relationships hold within a namespace but not across
+        # namespaces.
+        assert isinstance(obj_a, type(obj_a))
+        assert not isinstance(obj_a, type(obj_b))
+        assert not isinstance(obj_b, type(obj_a))
+
+    def test_class_identity_namespace_reuse_option(self):
+        class A:
+            class_attr = "original"
+
+        payload = cloudpickle.dumps(A, protocol=self.protocol)
+
+        # By default, reloading the same payload within one namespace reuses
+        # the class definition reconstructed by the first load.
+        reusing_ns = cloudpickle.ClassIdentityNamespace("reusing")
+        assert reusing_ns.reuse
+        a_first = reusing_ns.loads(payload)
+        a_second = reusing_ns.loads(payload)
+        assert a_first is a_second
+
+        # With reuse=False, each load reconstructs a fresh class definition.
+        fresh_ns = cloudpickle.ClassIdentityNamespace("fresh", reuse=False)
+        b_first = fresh_ns.loads(payload)
+        b_second = fresh_ns.loads(payload)
+        assert b_first is not b_second
+
+        # Identity within a single load is preserved even with reuse=False:
+        # all the instances of one payload belong to the same class.
+        graph_payload = cloudpickle.dumps([A(), A(), A], protocol=self.protocol)
+        inst1, inst2, cls = fresh_ns.loads(graph_payload)
+        assert type(inst1) is type(inst2) is cls
+        assert isinstance(inst1, cls)
+        assert isinstance(inst2, cls)
+
+    def test_class_identity_default_namespace_compat(self):
+        # The default entry points keep the historical behavior: loads share
+        # the process-global default namespace.
+        class A:
+            pass
+
+        payload = cloudpickle.dumps(A, protocol=self.protocol)
+        assert cloudpickle.loads(payload) is pickle.loads(payload)
+        assert cloudpickle.loads(payload, namespace=None) is pickle.loads(payload)
+
+        # An explicit namespace is isolated from the default one.
+        ns = cloudpickle.ClassIdentityNamespace("explicit")
+        assert cloudpickle.loads(payload, namespace=ns) is ns.loads(payload)
+        assert cloudpickle.loads(payload, namespace=ns) is not pickle.loads(payload)
+
+        # Invalid namespace values are rejected.
+        with pytest.raises(TypeError, match="ClassIdentityNamespace"):
+            cloudpickle.loads(payload, namespace="not-a-namespace")
+
+    def test_class_identity_namespace_inheritance_metaclass_selfref(self):
+        # Tracker lookups for base classes, metaclasses and self-references
+        # all obey the selected namespace.
+        def make_hierarchy():
+            class Meta(type):
+                pass
+
+            class Base(metaclass=Meta):
+                pass
+
+            class Child(Base):
+                pass
+
+            Base.self_ref = Base
+            return Base, Child
+
+        payload = cloudpickle.dumps(make_hierarchy(), protocol=self.protocol)
+        ns_a = cloudpickle.ClassIdentityNamespace("hier-a")
+        ns_b = cloudpickle.ClassIdentityNamespace("hier-b")
+
+        base_a, child_a = ns_a.loads(payload)
+        base_b, child_b = ns_b.loads(payload)
+
+        # Inheritance relationships are preserved within each namespace.
+        assert child_a.__bases__[0] is base_a
+        assert child_b.__bases__[0] is base_b
+        assert isinstance(child_a(), base_a)
+        assert not isinstance(child_a(), base_b)
+
+        # Dynamic metaclasses are also scoped to the namespace.
+        assert type(base_a) is not type(base_b)
+        assert type(base_a).__name__ == "Meta"
+        assert isinstance(base_a, type(base_a))
+
+        # Self-referencing class attributes point to the class of their own
+        # namespace.
+        assert base_a.self_ref is base_a
+        assert base_b.self_ref is base_b
+
+        # The same hierarchy loaded in the default namespace is yet another
+        # independent set of class definitions.
+        base_default, child_default = pickle.loads(payload)
+        assert base_default is not base_a
+        assert child_default.__bases__[0] is base_default
+
+    def test_class_identity_namespace_enum_and_typevar(self):
+        def make_payload():
+            class Color(enum.Enum):
+                RED = 1
+                GREEN = 2
+
+            T = typing.TypeVar("T")
+            return cloudpickle.dumps((Color, T), protocol=self.protocol)
+
+        payload = make_payload()
+        ns_a = cloudpickle.ClassIdentityNamespace("enum-a")
+        ns_b = cloudpickle.ClassIdentityNamespace("enum-b")
+
+        color_a, t_a = ns_a.loads(payload)
+        color_b, t_b = ns_b.loads(payload)
+
+        assert color_a is not color_b
+        assert t_a is not t_b
+        assert color_a.RED.value == 1
+        assert t_a.__name__ == "T"
+
+        # Enums and typevars are also reused across loads within a namespace.
+        assert ns_a.loads(payload)[0] is color_a
+        assert ns_a.loads(payload)[1] is t_a
+
+    def test_class_identity_namespace_dict_proxy_descriptor(self):
+        # Classes whose __dict__ is a property (proxy descriptor) go through
+        # a dedicated reconstruction path that must also obey the namespace.
+        def make_payload():
+            class Proxy:
+                @property
+                def __dict__(self):
+                    return {"proxied": True}
+
+            return cloudpickle.dumps(Proxy, protocol=self.protocol)
+
+        payload = make_payload()
+        ns_a = cloudpickle.ClassIdentityNamespace("proxy-a")
+        ns_b = cloudpickle.ClassIdentityNamespace("proxy-b")
+
+        proxy_a = ns_a.loads(payload)
+        proxy_b = ns_b.loads(payload)
+        assert proxy_a is not proxy_b
+        assert proxy_a().__dict__ == {"proxied": True}
+        assert ns_a.loads(payload) is proxy_a
+
+    def test_class_identity_namespace_context_manager(self):
+        # A namespace can be activated as a context manager so that any
+        # unpickling done in the block (even via plain pickle.loads) uses it.
+        class A:
+            pass
+
+        payload = cloudpickle.dumps(A, protocol=self.protocol)
+        ns = cloudpickle.ClassIdentityNamespace("ctx")
+        with ns:
+            inner = pickle.loads(payload)
+            # cloudpickle entry points without an explicit namespace use the
+            # activated one.
+            assert cloudpickle.loads(payload) is inner
+        assert inner is ns.loads(payload)
+        assert inner is not pickle.loads(payload)
+
+        # Nested activation is supported.
+        other = cloudpickle.ClassIdentityNamespace("other")
+        with ns:
+            with other:
+                other_cls = pickle.loads(payload)
+            assert pickle.loads(payload) is inner
+        assert other_cls is other.loads(payload)
+        assert other_cls is not inner
+
+    def test_get_class_identity_namespace_registry(self):
+        ns1 = cloudpickle.get_class_identity_namespace("session-1")
+        assert cloudpickle.get_class_identity_namespace("session-1") is ns1
+        assert ns1.name == "session-1"
+
+        ns2 = cloudpickle.get_class_identity_namespace("session-2")
+        assert ns2 is not ns1
+
+        # The reuse setting of an existing namespace cannot be changed.
+        with pytest.raises(ValueError, match="reuse"):
+            cloudpickle.get_class_identity_namespace("session-1", reuse=False)
+        ns3 = cloudpickle.get_class_identity_namespace("session-3", reuse=False)
+        assert not ns3.reuse
+
+    def test_class_identity_namespace_garbage_collection(self):
+        # Namespaces and the classes they track are only weakly held and can
+        # be reclaimed once no longer referenced.
+        from cloudpickle.cloudpickle import _CLASS_IDENTITY_NAMESPACE_REGISTRY
+
+        class A:
+            pass
+
+        payload = cloudpickle.dumps(A, protocol=self.protocol)
+        ns = cloudpickle.get_class_identity_namespace("ephemeral-session")
+        loaded_cls = ns.loads(payload)
+        assert len(ns._by_id) == 1
+
+        # Tracked classes are reclaimed once they are no longer referenced,
+        # even while the namespace is still alive.
+        cls_ref = weakref.ref(loaded_cls)
+        del loaded_cls
+        gc.collect()
+        assert cls_ref() is None
+        assert len(ns._by_id) == 0
+
+        # The registry does not keep namespaces alive.
+        ns_ref = weakref.ref(ns)
+        del ns
+        gc.collect()
+        assert ns_ref() is None
+        assert "ephemeral-session" not in _CLASS_IDENTITY_NAMESPACE_REGISTRY
+
+        # A fresh namespace is created on the next request.
+        new_ns = cloudpickle.get_class_identity_namespace("ephemeral-session")
+        assert len(new_ns._by_id) == 0
 
     def test_dynamic_func_deterministic_roundtrip(self):
         # Check that the pickle serialization for a dynamic func is the same
