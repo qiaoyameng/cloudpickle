@@ -54,6 +54,7 @@ import _collections_abc
 from collections import ChainMap, OrderedDict
 import abc
 import builtins
+import contextvars
 import copyreg
 import dataclasses
 import dis
@@ -90,9 +91,75 @@ _PICKLE_BY_VALUE_MODULES = set()
 # Track the provenance of reconstructed dynamic classes to make it possible to
 # reconstruct instances from the matching singleton class definition when
 # appropriate and preserve the usual "isinstance" semantics of Python objects.
-_DYNAMIC_CLASS_TRACKER_BY_CLASS = weakref.WeakKeyDictionary()
-_DYNAMIC_CLASS_TRACKER_BY_ID = weakref.WeakValueDictionary()
-_DYNAMIC_CLASS_TRACKER_LOCK = threading.Lock()
+#
+# The tracker state is namespaced: each loading session (see
+# ``DynamicClassLoadingSession``) gets its own tracker so that the same
+# dynamic class definition loaded in two isolated sessions yields two
+# independent class objects, while all the instances loaded within a single
+# session still share one and the same class. The default tracker below
+# preserves the historical process-wide behavior when no session is active.
+
+
+class _DynamicClassTracker:
+    """Registry mapping dynamic class tracker ids to class definitions.
+
+    Both mappings are weak so that tracked classes (and hence the tracker
+    itself) can be garbage collected once no live object references them.
+    """
+
+    def __init__(self):
+        self.by_class = weakref.WeakKeyDictionary()
+        self.by_id = weakref.WeakValueDictionary()
+        self.lock = threading.Lock()
+
+    def get_or_create_tracker_id(self, class_def):
+        with self.lock:
+            class_tracker_id = self.by_class.get(class_def)
+            if class_tracker_id is None:
+                class_tracker_id = uuid.uuid4().hex
+                self.by_class[class_def] = class_tracker_id
+                self.by_id[class_tracker_id] = class_def
+        return class_tracker_id
+
+    def get_tracker_id(self, class_def):
+        with self.lock:
+            return self.by_class.get(class_def)
+
+    def lookup_class_or_track(self, class_tracker_id, class_def, reuse=True):
+        with self.lock:
+            if reuse:
+                class_def = self.by_id.setdefault(class_tracker_id, class_def)
+            else:
+                # Reload semantics: do not reuse any previously tracked class
+                # for this id. Instead, make the freshly reconstructed class
+                # the canonical definition for this tracker id in this
+                # namespace from now on.
+                self.by_id[class_tracker_id] = class_def
+            self.by_class[class_def] = class_tracker_id
+        return class_def
+
+
+_DEFAULT_CLASS_TRACKER = _DynamicClassTracker()
+
+# Aliases to the state of the default (process-wide) tracker. Those are kept
+# for backward compatibility with downstream introspection code.
+_DYNAMIC_CLASS_TRACKER_BY_CLASS = _DEFAULT_CLASS_TRACKER.by_class
+_DYNAMIC_CLASS_TRACKER_BY_ID = _DEFAULT_CLASS_TRACKER.by_id
+_DYNAMIC_CLASS_TRACKER_LOCK = _DEFAULT_CLASS_TRACKER.lock
+
+# Registry of the named class identity namespaces. It only holds weak
+# references to the trackers: a namespace stays alive only as long as some
+# live session (or some other object) references it, so namespaces do not
+# leak memory once all their sessions have been dropped.
+_DYNAMIC_CLASS_NAMESPACES = weakref.WeakValueDictionary()
+_DYNAMIC_CLASS_NAMESPACES_LOCK = threading.Lock()
+
+# The loading session that is currently active in this context (thread or
+# asyncio task), if any. Unpickling helpers resolve the class identity
+# namespace through this variable at load time.
+_ACTIVE_CLASS_LOADING_SESSION = contextvars.ContextVar(
+    "cloudpickle_active_class_loading_session", default=None
+)
 
 PYPY = platform.python_implementation() == "PyPy"
 
@@ -105,23 +172,141 @@ _extract_code_globals_cache = weakref.WeakKeyDictionary()
 
 
 def _get_or_create_tracker_id(class_def):
-    with _DYNAMIC_CLASS_TRACKER_LOCK:
-        class_tracker_id = _DYNAMIC_CLASS_TRACKER_BY_CLASS.get(class_def)
-        if class_tracker_id is None:
-            class_tracker_id = uuid.uuid4().hex
-            _DYNAMIC_CLASS_TRACKER_BY_CLASS[class_def] = class_tracker_id
-            _DYNAMIC_CLASS_TRACKER_BY_ID[class_tracker_id] = class_def
-    return class_tracker_id
+    # The tracker id identifies a class *object*: it is stable process-wide
+    # and does not depend on the namespace used at load time. When a session
+    # is active, first consult its tracker so that classes reconstructed in
+    # this session keep their session-local identity when re-pickled.
+    # Otherwise, fall back to the default tracker so that a given class
+    # object always pickles with the same tracker id regardless of the
+    # pickling context.
+    session = _ACTIVE_CLASS_LOADING_SESSION.get()
+    if session is not None:
+        class_tracker_id = session.tracker.get_tracker_id(class_def)
+        if class_tracker_id is not None:
+            return class_tracker_id
+    return _DEFAULT_CLASS_TRACKER.get_or_create_tracker_id(class_def)
 
 
 def _lookup_class_or_track(class_tracker_id, class_def):
-    if class_tracker_id is not None:
-        with _DYNAMIC_CLASS_TRACKER_LOCK:
-            class_def = _DYNAMIC_CLASS_TRACKER_BY_ID.setdefault(
-                class_tracker_id, class_def
+    if class_tracker_id is None:
+        return class_def
+    session = _ACTIVE_CLASS_LOADING_SESSION.get()
+    if session is None:
+        return _DEFAULT_CLASS_TRACKER.lookup_class_or_track(
+            class_tracker_id, class_def
+        )
+    return session.tracker.lookup_class_or_track(
+        class_tracker_id, class_def, reuse=session.reuse_tracked_classes
+    )
+
+
+class DynamicClassLoadingSession:
+    """Loading session isolating the identity of dynamic classes.
+
+    Unpickling a dynamic class definition (a class pickled by value) normally
+    reuses a process-wide registry so that all the objects loaded in the
+    process that stem from the same class definition share a single class
+    object. When the same definition is loaded in two isolated tasks, this
+    sharing may be undesirable: class-level state mutated by one task (class
+    attributes, enum members, ...) becomes visible to the other.
+
+    Loading the same payload inside two distinct
+    ``DynamicClassLoadingSession`` instances instead yields two independent
+    class objects with independent class state, while all the instances
+    loaded within a single session still belong to one and the same class.
+    This applies uniformly to plain class skeletons, enums, TypeVars and to
+    the tracker lookups performed for base classes (inheritance), metaclasses
+    and self-referential class definitions.
+
+    Parameters
+    ----------
+    namespace : str, optional
+        Name of the class identity namespace to load into. Sessions created
+        with the same name share the same class identity state for as long as
+        at least one of them is alive. If None (default), the session uses
+        its own anonymous namespace that is not shared with any other
+        session.
+    reuse_tracked_classes : bool, optional
+        Whether reloading a class definition that was already loaded in this
+        session reuses the existing class object (default, True). When False,
+        each load reconstructs a fresh class object which then becomes the
+        canonical definition for its tracker id within this session.
+
+    Notes
+    -----
+    This is a class *identity* isolation mechanism only: it is not an
+    execution sandbox. Unpickling data from untrusted sources can execute
+    arbitrary code regardless of the session used.
+
+    Namespaces are only weakly referenced by the module-level registry: once
+    all the sessions (and classes) of a namespace are dropped, the namespace
+    and its state are garbage collected.
+
+    Examples
+    --------
+    >>> import pickle, cloudpickle
+    >>> payload = cloudpickle.dumps(type("A", (), {"value": 0}))
+    >>> with cloudpickle.DynamicClassLoadingSession() as s1:
+    ...     A1 = pickle.loads(payload)
+    >>> with cloudpickle.DynamicClassLoadingSession() as s2:
+    ...     A2 = pickle.loads(payload)
+    >>> A1 is A2
+    False
+    >>> A1.value = 42
+    >>> A2.value
+    0
+    """
+
+    def __init__(self, namespace=None, *, reuse_tracked_classes=True):
+        if namespace is not None and not isinstance(namespace, str):
+            raise TypeError(
+                "namespace should be a str or None, got "
+                f"{type(namespace).__name__} instead"
             )
-            _DYNAMIC_CLASS_TRACKER_BY_CLASS[class_def] = class_tracker_id
-    return class_def
+        self.namespace = namespace
+        self.reuse_tracked_classes = bool(reuse_tracked_classes)
+        self._tracker = None
+        self._token = None
+
+    @property
+    def tracker(self):
+        # The tracker is resolved lazily so that sessions with the same
+        # namespace name share the same tracker for as long as at least one
+        # of them is alive, without the registry keeping namespaces alive
+        # forever.
+        tracker = self._tracker
+        if tracker is None:
+            if self.namespace is None:
+                tracker = _DynamicClassTracker()
+            else:
+                with _DYNAMIC_CLASS_NAMESPACES_LOCK:
+                    tracker = _DYNAMIC_CLASS_NAMESPACES.get(self.namespace)
+                    if tracker is None:
+                        tracker = _DynamicClassTracker()
+                        _DYNAMIC_CLASS_NAMESPACES[self.namespace] = tracker
+            self._tracker = tracker
+        return tracker
+
+    def __enter__(self):
+        if self._token is not None:
+            raise RuntimeError("this DynamicClassLoadingSession is already active")
+        self._token = _ACTIVE_CLASS_LOADING_SESSION.set(self)
+        return self
+
+    def __exit__(self, *exc_info):
+        _ACTIVE_CLASS_LOADING_SESSION.reset(self._token)
+        self._token = None
+        return False
+
+    def loads(self, data, **kwargs):
+        """Load a pickle payload within this session."""
+        with self:
+            return pickle.loads(data, **kwargs)
+
+    def load(self, file, **kwargs):
+        """Load a pickle payload from a file within this session."""
+        with self:
+            return pickle.load(file, **kwargs)
 
 
 def register_pickle_by_value(module):

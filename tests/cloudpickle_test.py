@@ -4,6 +4,7 @@ import collections
 import base64
 import dataclasses
 import functools
+import gc
 import io
 import itertools
 import logging
@@ -3178,6 +3179,227 @@ def test_module_level_pickler():
     # cloudpickle.Pickler
     assert hasattr(cloudpickle, "Pickler")
     assert cloudpickle.Pickler is cloudpickle.CloudPickler
+
+
+def _make_dynamic_class_payload():
+    class A:
+        value = 0
+
+        def get(self):
+            return self.value
+
+    return cloudpickle.dumps(A)
+
+
+def test_loading_session_isolates_class_state():
+    # The same dynamic class definition loaded in two distinct sessions
+    # yields two independent class objects with independent class state,
+    # while the default (session-less) loading keeps sharing one class.
+    payload = _make_dynamic_class_payload()
+
+    default_class_1 = pickle.loads(payload)
+    default_class_2 = pickle.loads(payload)
+    assert default_class_1 is default_class_2
+
+    with cloudpickle.DynamicClassLoadingSession():
+        class_1 = pickle.loads(payload)
+    with cloudpickle.DynamicClassLoadingSession():
+        class_2 = pickle.loads(payload)
+
+    assert class_1 is not class_2
+    assert class_1 is not default_class_1
+    assert class_2 is not default_class_1
+
+    class_1.value = 42
+    assert class_2.value == 0
+    assert default_class_1.value == 0
+
+
+def test_loading_session_reuses_class_within_session():
+    # All the objects loaded within a single session share one and the same
+    # class: isinstance semantics are preserved inside the session.
+    payload = _make_dynamic_class_payload()
+
+    with cloudpickle.DynamicClassLoadingSession():
+        class_1 = pickle.loads(payload)
+        class_2 = pickle.loads(payload)
+        assert class_1 is class_2
+
+        instance = pickle.loads(cloudpickle.dumps(pickle.loads(payload)()))
+        assert type(instance) is class_1
+        assert isinstance(instance, class_1)
+
+
+def test_loading_session_reuse_tracked_classes_option():
+    # reloads within a session reuse the tracked class by default, and
+    # reconstruct a fresh class when reuse_tracked_classes=False.
+    payload = _make_dynamic_class_payload()
+
+    with cloudpickle.DynamicClassLoadingSession(reuse_tracked_classes=True):
+        assert pickle.loads(payload) is pickle.loads(payload)
+
+    with cloudpickle.DynamicClassLoadingSession(reuse_tracked_classes=False):
+        class_1 = pickle.loads(payload)
+        class_2 = pickle.loads(payload)
+        assert class_1 is not class_2
+        class_1.value = 42
+        assert class_2.value == 0
+
+
+def test_loading_session_named_namespaces():
+    # Sessions bound to the same namespace name share class identity state
+    # for as long as at least one of them is alive.
+    payload = _make_dynamic_class_payload()
+
+    session_1 = cloudpickle.DynamicClassLoadingSession("task")
+    with session_1:
+        class_1 = pickle.loads(payload)
+    session_2 = cloudpickle.DynamicClassLoadingSession("task")
+    with session_2:
+        class_2 = pickle.loads(payload)
+    assert class_1 is class_2
+
+    with cloudpickle.DynamicClassLoadingSession("other-task"):
+        assert pickle.loads(payload) is not class_1
+
+    with pytest.raises(TypeError, match="namespace should be a str or None"):
+        cloudpickle.DynamicClassLoadingSession(namespace=42)
+
+
+def test_loading_session_loads_convenience_method():
+    payload = _make_dynamic_class_payload()
+    session = cloudpickle.DynamicClassLoadingSession()
+    class_1 = session.loads(payload)
+    class_2 = session.loads(payload)
+    assert class_1 is class_2
+
+    # A session can be exited and re-entered sequentially.
+    with session:
+        assert pickle.loads(payload) is class_1
+
+    # A session cannot be re-entered while already active.
+    with pytest.raises(RuntimeError, match="already active"):
+        with session:
+            with session:
+                pass
+
+
+def test_loading_session_enum_and_typevar():
+    # Enums and TypeVars loaded in distinct sessions are isolated, and
+    # reused within a single session.
+    class Color(enum.Enum):
+        RED = 1
+        BLUE = 2
+
+    enum_payload = cloudpickle.dumps(Color)
+    typevar_payload = cloudpickle.dumps(typing.TypeVar("T"))
+
+    with cloudpickle.DynamicClassLoadingSession():
+        enum_1 = pickle.loads(enum_payload)
+        typevar_1 = pickle.loads(typevar_payload)
+        assert pickle.loads(enum_payload) is enum_1
+        assert pickle.loads(typevar_payload) is typevar_1
+        assert enum_1.RED is pickle.loads(enum_payload).RED
+
+    with cloudpickle.DynamicClassLoadingSession():
+        enum_2 = pickle.loads(enum_payload)
+        typevar_2 = pickle.loads(typevar_payload)
+
+    assert enum_1 is not enum_2
+    assert enum_1.RED is not enum_2.RED
+    assert type(enum_1.RED) is enum_1
+    assert typevar_1 is not typevar_2
+    assert typevar_1.__name__ == typevar_2.__name__ == "T"
+
+
+def test_loading_session_inheritance_and_metaclass():
+    # Tracker lookups for base classes and metaclasses obey the session
+    # namespace: the inheritance chain reconstructed in a session only
+    # refers to classes of that same session.
+    class Meta(type):
+        pass
+
+    class Base(metaclass=Meta):
+        pass
+
+    class Child(Base):
+        pass
+
+    base_payload = cloudpickle.dumps(Base)
+    child_payload = cloudpickle.dumps(Child)
+
+    with cloudpickle.DynamicClassLoadingSession():
+        base_1 = pickle.loads(base_payload)
+        child_1 = pickle.loads(child_payload)
+        assert child_1.__bases__ == (base_1,)
+        assert issubclass(child_1, base_1)
+        meta_1 = type(base_1)
+        assert type(child_1) is meta_1
+        assert meta_1 is not Meta
+
+    with cloudpickle.DynamicClassLoadingSession():
+        base_2 = pickle.loads(base_payload)
+        child_2 = pickle.loads(child_payload)
+        assert child_2.__bases__ == (base_2,)
+
+    assert base_1 is not base_2
+    assert child_1 is not child_2
+    assert not issubclass(child_1, base_2)
+    assert not issubclass(child_2, base_1)
+
+
+def test_loading_session_self_referential_class():
+    # Self-references in the class dict (class attributes pointing to the
+    # class itself or to its instances) resolve to the session-local class.
+    class Node:
+        pass
+
+    Node.self_ref = Node
+    Node.instance = Node()
+    payload = cloudpickle.dumps(Node)
+
+    with cloudpickle.DynamicClassLoadingSession():
+        node_1 = pickle.loads(payload)
+        assert node_1.self_ref is node_1
+        assert isinstance(node_1.instance, node_1)
+
+    with cloudpickle.DynamicClassLoadingSession():
+        node_2 = pickle.loads(payload)
+        assert node_2.self_ref is node_2
+
+    assert node_1 is not node_2
+    assert node_1.self_ref is not node_2.self_ref
+
+
+def test_loading_session_garbage_collection():
+    # Namespaces are not strongly referenced by the module-level registry:
+    # once the sessions and the classes of a namespace are dropped, the
+    # namespace state is garbage collected.
+    from cloudpickle.cloudpickle import _DYNAMIC_CLASS_NAMESPACES
+
+    payload = _make_dynamic_class_payload()
+
+    session = cloudpickle.DynamicClassLoadingSession("gc-task")
+    with session:
+        cls = pickle.loads(payload)
+    tracker_ref = weakref.ref(session.tracker)
+    class_ref = weakref.ref(cls)
+    assert "gc-task" in _DYNAMIC_CLASS_NAMESPACES
+
+    del session, cls
+    gc.collect()
+    assert class_ref() is None
+    assert tracker_ref() is None
+    assert "gc-task" not in _DYNAMIC_CLASS_NAMESPACES
+
+    # Anonymous sessions are never registered and are collected as well.
+    session = cloudpickle.DynamicClassLoadingSession()
+    with session:
+        cls = pickle.loads(payload)
+    tracker_ref = weakref.ref(session.tracker)
+    del session, cls
+    gc.collect()
+    assert tracker_ref() is None
 
 
 if __name__ == "__main__":

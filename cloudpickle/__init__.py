@@ -15,4 +15,5 @@ __all__ = [  # noqa
     "load",
     "register_pickle_by_value",
     "unregister_pickle_by_value",
+    "DynamicClassLoadingSession",
 ]

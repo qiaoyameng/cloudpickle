@@ -1,6 +1,18 @@
 In development
 ==============
 
+- Add `cloudpickle.DynamicClassLoadingSession`, an explicit dynamic class
+  identity namespace / loading session mechanism. Loading the same dynamic
+  class definition in two distinct sessions now yields independent class
+  objects with independent class state, while all the instances loaded
+  within a single session still share one and the same class. Class
+  skeletons, enums, TypeVars and the tracker lookups performed for base
+  classes and metaclasses all obey the selected namespace, and whether
+  reloading within a session reuses the tracked class is controlled by the
+  `reuse_tracked_classes` option. The default, session-less entry points
+  keep the historical process-wide behavior. Note that this is a class
+  identity isolation mechanism only, not an execution sandbox.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 
