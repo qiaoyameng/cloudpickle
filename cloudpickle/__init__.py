@@ -13,6 +13,8 @@ __all__ = [  # noqa
     "loads",
     "dump",
     "load",
+    "ModulePicklePolicy",
+    "ModulePolicy",
     "register_pickle_by_value",
     "unregister_pickle_by_value",
 ]

@@ -84,6 +84,16 @@ from types import CellType  # noqa: F401
 # communication speed over compatibility:
 DEFAULT_PROTOCOL = pickle.HIGHEST_PROTOCOL
 
+
+class ModulePicklePolicy(Enum):
+    DEFAULT = "default"
+    BY_VALUE = "by_value"
+    BY_REFERENCE = "by_reference"
+
+
+ModulePolicy = ModulePicklePolicy
+
+
 # Names of modules whose resources should be treated as dynamic.
 _PICKLE_BY_VALUE_MODULES = set()
 
@@ -191,6 +201,183 @@ def _is_registered_pickle_by_value(module):
     return False
 
 
+def _coerce_module_pickle_policy(policy):
+    if isinstance(policy, ModulePicklePolicy):
+        return policy
+    if isinstance(policy, str):
+        try:
+            return ModulePicklePolicy(policy)
+        except ValueError:
+            pass
+    raise ValueError(
+        "module pickle policy should be one of "
+        f"{', '.join(p.value for p in ModulePicklePolicy)}; got {policy!r}"
+    )
+
+
+def _module_name(module_or_name):
+    if isinstance(module_or_name, types.ModuleType):
+        return module_or_name.__name__
+    if isinstance(module_or_name, str):
+        return module_or_name
+    raise ValueError(
+        "Input should be a module object or module name, got "
+        f"{str(module_or_name)} instead"
+    )
+
+
+class _ModulePolicyResolver:
+    """Immutable module policy view used while traversing one pickle."""
+
+    def __init__(self, explicit_policies=None, modules=None):
+        self.explicit_policies = dict(explicit_policies or {})
+        self.pickle_by_value_modules = _PICKLE_BY_VALUE_MODULES.copy()
+        self.modules = sys.modules.copy() if modules is None else dict(modules)
+
+    def _registered_by_value(self, module_name):
+        if module_name in self.pickle_by_value_modules:
+            return True
+        while "." in module_name:
+            module_name = module_name.rsplit(".", 1)[0]
+            if module_name in self.pickle_by_value_modules:
+                return True
+        return False
+
+    def _explicit_policy(self, module_name):
+        best_name = None
+        best_policy = None
+        for pattern, policy in self.explicit_policies.items():
+            if module_name == pattern or module_name.startswith(pattern + "."):
+                if best_name is None or len(pattern) > len(best_name):
+                    best_name = pattern
+                    best_policy = policy
+        return best_policy
+
+    def _module_aliases(self, module):
+        canonical_name = module.__name__
+        yield canonical_name
+        for name, candidate in self.modules.items():
+            if candidate is module and name != canonical_name:
+                yield name
+
+    def _add_policy_candidate(self, best, candidate):
+        if best is None:
+            return candidate
+        old_kind = best[1]
+        new_kind = candidate[1]
+        if new_kind > old_kind:
+            return candidate
+        if new_kind < old_kind:
+            return best
+        if candidate[0] > best[0]:
+            return candidate
+        if candidate[0] < best[0]:
+            return best
+        return candidate if candidate[2] > best[2] else best
+
+    def policy_for_module(self, module):
+        best = None
+        for index, module_name in enumerate(self._module_aliases(module)):
+            policy = self._explicit_policy(module_name)
+            depth = module_name.count(".")
+            canonical = 1 if index == 0 else 0
+            if policy is not None:
+                candidate = (depth, 1, canonical, policy, module_name)
+                best = self._add_policy_candidate(best, candidate)
+
+            if self._registered_by_value(module_name):
+                candidate = (
+                    depth,
+                    0,
+                    canonical,
+                    ModulePicklePolicy.BY_VALUE,
+                    module_name,
+                )
+                best = self._add_policy_candidate(best, candidate)
+
+        if best is not None:
+            policy = best[3]
+            if policy is not ModulePicklePolicy.DEFAULT:
+                return policy
+
+        for module_name in self._module_aliases(module):
+            if module_name in self.modules:
+                return ModulePicklePolicy.BY_REFERENCE
+            for candidate in self.modules.values():
+                if candidate is module:
+                    return ModulePicklePolicy.BY_REFERENCE
+        return ModulePicklePolicy.BY_VALUE
+
+    def should_pickle_by_reference(self, obj, name=None):
+        if isinstance(obj, types.ModuleType):
+            policy = self.policy_for_module(obj)
+        elif (
+            isinstance(obj, types.FunctionType)
+            or issubclass(type(obj), type)
+            or isinstance(obj, typing.TypeVar)
+        ):
+            module_and_name = self.lookup_module_and_qualname(obj, name=name)
+            if module_and_name is None:
+                return False
+            module, _ = module_and_name
+            policy = self.policy_for_module(module)
+        else:
+            raise TypeError(
+                "cannot check importability of {} instances".format(
+                    type(obj).__name__
+                )
+            )
+        return policy == ModulePicklePolicy.BY_REFERENCE
+
+    def lookup_modules_and_qualnames(self, obj, name=None):
+        if name is None:
+            name = getattr(obj, "__qualname__", None)
+        if name is None:
+            name = getattr(obj, "__name__", None)
+
+        declared_name = getattr(obj, "__module__", None)
+        if declared_name in ("__main__", "__mp_main__"):
+            return
+
+        if declared_name is not None:
+            declared_module = self.modules.get(declared_name)
+            if isinstance(declared_module, types.ModuleType):
+                try:
+                    candidate = _getattribute(declared_module, name)
+                except Exception:
+                    candidate = None
+                if candidate is obj:
+                    yield declared_module, name
+                    return
+
+        module_names = []
+        for module_name, module in self.modules.items():
+            if (
+                module_name in ("__main__", "__mp_main__")
+                or module is None
+                or not isinstance(module, types.ModuleType)
+            ):
+                continue
+            if module_name not in module_names:
+                module_names.append(module_name)
+
+        for module_name in module_names:
+            module = self.modules.get(module_name)
+            if not isinstance(module, types.ModuleType):
+                continue
+            try:
+                candidate = _getattribute(module, name)
+            except Exception:
+                continue
+            if candidate is obj:
+                yield module, name
+
+    def lookup_module_and_qualname(self, obj, name=None):
+        for module, qualname in self.lookup_modules_and_qualnames(obj, name=name):
+            return module, qualname
+        return None
+
+
 if sys.version_info >= (3, 14):
 
     def _getattribute(obj, name):
@@ -250,26 +437,7 @@ def _should_pickle_by_reference(obj, name=None):
     functions and classes or for attributes of modules that have been
     explicitly registered to be pickled by value.
     """
-    if isinstance(obj, types.FunctionType) or issubclass(type(obj), type):
-        module_and_name = _lookup_module_and_qualname(obj, name=name)
-        if module_and_name is None:
-            return False
-        module, name = module_and_name
-        return not _is_registered_pickle_by_value(module)
-
-    elif isinstance(obj, types.ModuleType):
-        # We assume that sys.modules is primarily used as a cache mechanism for
-        # the Python import machinery. Checking if a module has been added in
-        # is sys.modules therefore a cheap and simple heuristic to tell us
-        # whether we can assume that a given module could be imported by name
-        # in another Python process.
-        if _is_registered_pickle_by_value(obj):
-            return False
-        return obj.__name__ in sys.modules
-    else:
-        raise TypeError(
-            "cannot check importability of {} instances".format(type(obj).__name__)
-        )
+    return _ModulePolicyResolver().should_pickle_by_reference(obj, name=name)
 
 
 def _lookup_module_and_qualname(obj, name=None):
@@ -617,14 +785,16 @@ def _decompose_typevar(obj):
     )
 
 
-def _typevar_reduce(obj):
+def _typevar_reduce(obj, resolver=None):
+    if resolver is None:
+        resolver = _ModulePolicyResolver()
     # TypeVar instances require the module information hence why we
     # are not using the _should_pickle_by_reference directly
-    module_and_name = _lookup_module_and_qualname(obj, name=obj.__name__)
+    module_and_name = resolver.lookup_module_and_qualname(obj, name=obj.__name__)
 
     if module_and_name is None:
         return (_make_typevar, _decompose_typevar(obj))
-    elif _is_registered_pickle_by_value(module_and_name[0]):
+    elif not resolver.should_pickle_by_reference(obj, name=obj.__name__):
         return (_make_typevar, _decompose_typevar(obj))
 
     return (getattr, module_and_name)
@@ -1020,8 +1190,8 @@ def _memoryview_reduce(obj):
     return bytes, (obj.tobytes(),)
 
 
-def _module_reduce(obj):
-    if _should_pickle_by_reference(obj):
+def _module_reduce(obj, resolver):
+    if resolver.should_pickle_by_reference(obj):
         return subimport, (obj.__name__,)
     else:
         # Some external libraries can populate the "__builtins__" entry of a
@@ -1236,6 +1406,9 @@ def _get_dataclass_field_type_sentinel(name):
 
 
 class Pickler(pickle.Pickler):
+    ModulePicklePolicy = ModulePicklePolicy
+    ModulePolicy = ModulePolicy
+
     # set of reducers defined and used by cloudpickle (private)
     _dispatch_table = {}
     _dispatch_table[classmethod] = _classmethod_reduce
@@ -1248,11 +1421,9 @@ class Pickler(pickle.Pickler):
     _dispatch_table[CellType] = _cell_reduce
     _dispatch_table[types.CodeType] = _code_reduce
     _dispatch_table[types.GetSetDescriptorType] = _getset_descriptor_reduce
-    _dispatch_table[types.ModuleType] = _module_reduce
     _dispatch_table[types.MethodType] = _method_reduce
     _dispatch_table[types.MappingProxyType] = _mappingproxy_reduce
     _dispatch_table[weakref.WeakSet] = _weakset_reduce
-    _dispatch_table[typing.TypeVar] = _typevar_reduce
     _dispatch_table[_collections_abc.dict_keys] = _dict_keys_reduce
     _dispatch_table[_collections_abc.dict_values] = _dict_values_reduce
     _dispatch_table[_collections_abc.dict_items] = _dict_items_reduce
@@ -1284,10 +1455,29 @@ class Pickler(pickle.Pickler):
         obj using a custom cloudpickle reducer designed specifically to handle
         dynamic functions.
         """
-        if _should_pickle_by_reference(obj):
+        if self._module_policy.should_pickle_by_reference(obj):
             return NotImplemented
         else:
             return self._dynamic_function_reduce(obj)
+
+    def _module_reduce(self, obj):
+        return _module_reduce(obj, self._module_policy)
+
+    def _typevar_reduce(self, obj):
+        return _typevar_reduce(obj, self._module_policy)
+
+    def _class_reduce(self, obj):
+        if obj is type(None):  # noqa
+            return type, (None,)
+        elif obj is type(Ellipsis):
+            return type, (Ellipsis,)
+        elif obj is type(NotImplemented):
+            return type, (NotImplemented,)
+        elif obj in _BUILTIN_TYPE_NAMES:
+            return _builtin_type, (_BUILTIN_TYPE_NAMES[obj],)
+        elif not self._module_policy.should_pickle_by_reference(obj):
+            return _dynamic_class_reduce(obj)
+        return NotImplemented
 
     def _function_getnewargs(self, func):
         code = func.__code__
@@ -1323,13 +1513,25 @@ class Pickler(pickle.Pickler):
         return code, base_globals, None, None, closure
 
     def dump(self, obj):
+        self._module_policy = _ModulePolicyResolver(self._explicit_module_policies)
+        self._dumping = True
         try:
             return super().dump(obj)
         except RecursionError as e:
             msg = "Could not pickle object as excessively deep recursion required."
             raise pickle.PicklingError(msg) from e
+        finally:
+            self._dumping = False
 
-    def __init__(self, file, protocol=None, buffer_callback=None):
+    def __init__(
+        self,
+        file,
+        protocol=None,
+        buffer_callback=None,
+        module_policy=None,
+        pickle_by_value=None,
+        pickle_by_reference=None,
+    ):
         if protocol is None:
             protocol = DEFAULT_PROTOCOL
         super().__init__(file, protocol=protocol, buffer_callback=buffer_callback)
@@ -1338,6 +1540,79 @@ class Pickler(pickle.Pickler):
         # their global namespace at unpickling time.
         self.globals_ref = {}
         self.proto = int(protocol)
+        self._dumping = False
+        self._explicit_module_policies = {}
+        if module_policy is None:
+            module_policy = {}
+        elif isinstance(module_policy, types.ModuleType):
+            module_policy = {module_policy: ModulePicklePolicy.DEFAULT}
+        elif not hasattr(module_policy, "items"):
+            raise TypeError(
+                "module_policy should be a mapping or None, got "
+                f"{type(module_policy).__name__}"
+            )
+        for module, policy in module_policy.items():
+            self.set_module_policy(module, policy)
+        if pickle_by_value is not None:
+            self.register_pickle_by_value(pickle_by_value)
+        if pickle_by_reference is not None:
+            self.register_pickle_by_reference(pickle_by_reference)
+        self._module_policy = _ModulePolicyResolver(self._explicit_module_policies)
+        if PYPY:
+            self.dispatch_table = type(self).dispatch_table.new_child(
+                {
+                    types.ModuleType: self._module_reduce,
+                    typing.TypeVar: self._typevar_reduce,
+                }
+            )
+
+    def register_pickle_by_value(self, modules):
+        self._set_policy_for_modules(modules, ModulePicklePolicy.BY_VALUE)
+
+    def unregister_pickle_by_value(self, modules):
+        self._unset_policy_for_modules(modules, ModulePicklePolicy.BY_VALUE)
+
+    def register_pickle_by_reference(self, modules):
+        self._set_policy_for_modules(modules, ModulePicklePolicy.BY_REFERENCE)
+
+    def unregister_pickle_by_reference(self, modules):
+        self._unset_policy_for_modules(modules, ModulePicklePolicy.BY_REFERENCE)
+
+    def set_module_policy(self, module, policy):
+        policy = _coerce_module_pickle_policy(policy)
+        module_name = _module_name(module)
+        self._explicit_module_policies[module_name] = policy
+        self._refresh_module_policy()
+
+    def unset_module_policy(self, module):
+        module_name = _module_name(module)
+        try:
+            del self._explicit_module_policies[module_name]
+        except KeyError:
+            raise ValueError(f"{module_name} has no explicit module policy")
+        self._refresh_module_policy()
+
+    def _refresh_module_policy(self):
+        if not getattr(self, "_dumping", False):
+            self._module_policy = _ModulePolicyResolver(self._explicit_module_policies)
+
+    def _set_policy_for_modules(self, modules, policy):
+        if isinstance(modules, (types.ModuleType, str)):
+            modules = [modules]
+        for module in modules:
+            self.set_module_policy(module, policy)
+
+    def _unset_policy_for_modules(self, modules, policy):
+        if isinstance(modules, (types.ModuleType, str)):
+            modules = [modules]
+        for module in modules:
+            module_name = _module_name(module)
+            if self._explicit_module_policies.get(module_name) != policy:
+                expected = policy.value
+                raise ValueError(
+                    f"{module_name} is not registered for pickle {expected}"
+                )
+            self.unset_module_policy(module_name)
 
     if not PYPY:
         # pickle.Pickler is the C implementation of the CPython pickler and
@@ -1404,9 +1679,13 @@ class Pickler(pickle.Pickler):
                 is_anyclass = False
 
             if is_anyclass:
-                return _class_reduce(obj)
+                return self._class_reduce(obj)
             elif isinstance(obj, types.FunctionType):
                 return self._function_reduce(obj)
+            elif isinstance(obj, types.ModuleType):
+                return self._module_reduce(obj)
+            elif isinstance(obj, typing.TypeVar):
+                return self._typevar_reduce(obj)
             else:
                 # fallback to save_global, including the Pickler's
                 # dispatch_table
@@ -1471,7 +1750,7 @@ class Pickler(pickle.Pickler):
 
             if name is not None:
                 super().save_global(obj, name=name)
-            elif not _should_pickle_by_reference(obj, name=name):
+            elif not self._module_policy.should_pickle_by_reference(obj, name=name):
                 self._save_reduce_pickle5(*_dynamic_class_reduce(obj), obj=obj)
             else:
                 super().save_global(obj, name=name)
@@ -1484,7 +1763,7 @@ class Pickler(pickle.Pickler):
             Determines what kind of function obj is (e.g. lambda, defined at
             interactive prompt, etc) and handles the pickling appropriately.
             """
-            if _should_pickle_by_reference(obj, name=name):
+            if self._module_policy.should_pickle_by_reference(obj, name=name):
                 return super().save_global(obj, name=name)
             elif PYPY and isinstance(obj.__code__, builtin_code_type):
                 return self.save_pypy_builtin_func(obj)

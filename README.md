@@ -105,6 +105,26 @@ Using this API, there is no need to re-install the new version of the module on
 all the worker nodes nor to restart the workers: restarting the client Python
 process with the new source code is enough.
 
+For a single pickler, pass `module_policy` to `cloudpickle.Pickler` instead of
+temporarily changing the global registry:
+
+```python
+>>> from cloudpickle import Pickler, ModulePicklePolicy
+>>> pickler = Pickler(
+...     file,
+...     module_policy={
+...         "my_package": ModulePicklePolicy.BY_VALUE,
+...         "my_package.stable": ModulePicklePolicy.BY_REFERENCE,
+...     },
+... )
+```
+
+`ModulePicklePolicy.DEFAULT` follows cloudpickle's usual importability rules
+(and can therefore override the global registry for one pickler). Patterns apply
+to a module and all its submodules; the most specific rule wins. The policy is
+fixed when `dump` starts, so two picklers with different policies can be used
+interleaved without polluting each other.
+
 Note that this feature is still **experimental**, and may fail in the following
 situations:
 
