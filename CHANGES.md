@@ -1,6 +1,12 @@
 In development
 ==============
 
+- Preserve the identity of closure cells shared between pickled functions:
+  several closures referencing the same free variable (for instance a
+  getter/setter pair) now keep sharing the same cell after unpickling, so
+  rebinding the variable from one closure is visible from the others.
+  Recursive functions, empty cells and cells stored in containers are
+  supported, while distinct cells containing equal values remain distinct.
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

@@ -539,6 +539,21 @@ def _make_cell(value=_empty_cell_value):
     return cell
 
 
+def _identity(obj):
+    # Identity reducer used to put an already reconstructed object (and in
+    # particular an already memoized empty closure cell) back on the
+    # unpickler stack without creating a new object.
+    return obj
+
+
+def _cell_set_contents(cell, value):
+    # Fill an empty closure cell, or rebind an existing one. Empty cells are
+    # represented at pickling time by the _empty_cell_value sentinel.
+    if value is not _empty_cell_value:
+        cell.cell_contents = value
+    return cell
+
+
 def _make_skeleton_class(
     type_constructor, name, bases, type_kwargs, class_tracker_id, extra
 ):
@@ -949,16 +964,6 @@ def _code_reduce(obj):
     return types.CodeType, args
 
 
-def _cell_reduce(obj):
-    """Cell (containing values of a function's free variables) reducer."""
-    try:
-        obj.cell_contents
-    except ValueError:  # cell is empty
-        return _make_empty_cell, ()
-    else:
-        return _make_cell, (obj.cell_contents,)
-
-
 def _classmethod_reduce(obj):
     orig_func = obj.__func__
     return type(obj), (orig_func,)
@@ -1245,7 +1250,6 @@ class Pickler(pickle.Pickler):
     _dispatch_table[memoryview] = _memoryview_reduce
     _dispatch_table[property] = _property_reduce
     _dispatch_table[staticmethod] = _classmethod_reduce
-    _dispatch_table[CellType] = _cell_reduce
     _dispatch_table[types.CodeType] = _code_reduce
     _dispatch_table[types.GetSetDescriptorType] = _getset_descriptor_reduce
     _dispatch_table[types.ModuleType] = _module_reduce
@@ -1313,14 +1317,67 @@ class Pickler(pickle.Pickler):
                 if k in func.__globals__:
                     base_globals[k] = func.__globals__[k]
 
-        # Do not bind the free variables before the function is created to
-        # avoid infinite recursion.
+        # Closure cells are first reconstructed as shared empty cells to avoid
+        # infinite recursion when cells contain their owning functions or when
+        # functions reference each other recursively. Their contents are bound
+        # later, once all skeletons exist (in _function_setstate, or through
+        # the cell's own state setter for cells stored outside of a function
+        # closure). The same original cell is always mapped to the same
+        # reconstructed cell, including when it is referenced by several
+        # functions or stored in a container (see _reduce_cell).
         if func.__closure__ is None:
             closure = None
         else:
-            closure = tuple(_make_empty_cell() for _ in range(len(code.co_freevars)))
+            closure = tuple(
+                self._get_closure_shell(cell) for cell in func.__closure__
+            )
 
         return code, base_globals, None, None, closure
+
+    def _get_closure_shell(self, cell):
+        """Return the shared empty cell replacing ``cell`` while pickling.
+
+        Closure cells are reconstructed in two stages: an empty cell is first
+        created and memoized (possibly shared by several functions), then its
+        contents are set through a state setter. Mapping original cells to
+        their reconstructed shell by identity guarantees that distinct cells
+        with equal contents are never merged, while cells shared between
+        functions remain shared after the round trip.
+        """
+        shell = self._closure_shells.get(id(cell))
+        if shell is None:
+            shell = _make_empty_cell()
+            self._closure_shells[id(cell)] = shell
+            self._closure_shell_ids.add(id(shell))
+        return shell
+
+    def _reduce_cell(self, cell):
+        """Reducer preserving the identity of shared closure cells.
+
+        Cells referenced by dynamic functions are replaced by a unique
+        (possibly shared) empty cell, whose contents are filled only once the
+        cell, and any function or object referencing it, has been created.
+        This breaks cycles (such as a cell containing its owning function)
+        while keeping shared cells identical after unpickling.
+        """
+        if id(cell) in self._closure_shell_ids:
+            # ``cell`` is an empty shell created to stand in for an original
+            # closure cell: simply reconstruct it empty. Its contents are
+            # bound later through the state setter of the original cell.
+            return _make_empty_cell, ()
+        shell = self._get_closure_shell(cell)
+        try:
+            value = cell.cell_contents
+        except ValueError:  # cell is empty
+            value = _empty_cell_value
+        return (
+            _identity,
+            (shell,),
+            value,
+            None,
+            None,
+            _cell_set_contents,
+        )
 
     def dump(self, obj):
         try:
@@ -1337,6 +1394,14 @@ class Pickler(pickle.Pickler):
         # sharing the same global namespace at pickling time also share
         # their global namespace at unpickling time.
         self.globals_ref = {}
+        # Map the id of each closure cell to the unique empty cell (the
+        # "shell") used to reconstruct it. Using the cell identity as key
+        # ensures that cells shared between closures remain shared while
+        # distinct cells containing equal values are not merged.
+        self._closure_shells = {}
+        # Identities of the empty shell cells themselves, to distinguish them
+        # from the original closure cells when reducing.
+        self._closure_shell_ids = set()
         self.proto = int(protocol)
 
     if not PYPY:
@@ -1407,6 +1472,8 @@ class Pickler(pickle.Pickler):
                 return _class_reduce(obj)
             elif isinstance(obj, types.FunctionType):
                 return self._function_reduce(obj)
+            elif t is CellType:
+                return self._reduce_cell(obj)
             else:
                 # fallback to save_global, including the Pickler's
                 # dispatch_table
@@ -1519,6 +1586,15 @@ class Pickler(pickle.Pickler):
             self.save_reduce(*rv, obj=obj)
 
         dispatch[types.FunctionType] = save_function
+
+        def save_cell(self, obj):
+            # Closure cells are reconstructed as a shared empty cell whose
+            # contents are filled later via a state setter, so that cells
+            # shared between closures keep the same identity (see
+            # Pickler._reduce_cell).
+            self._save_reduce_pickle5(*self._reduce_cell(obj), obj=obj)
+
+        dispatch[CellType] = save_cell
 
 
 # Shorthands similar to pickle.dump/pickle.dumps

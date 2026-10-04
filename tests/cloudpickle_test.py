@@ -335,6 +335,91 @@ class CloudPickleTest(unittest.TestCase):
         g = pickle_depickle(f(), protocol=self.protocol)
         self.assertEqual(g(), 2)
 
+    def test_shared_closure_cell_identity_is_preserved(self):
+        # Functions produced by the same factory share the same closure cell:
+        # rebinding the free variable from one closure must be visible from
+        # the other after pickling, i.e. the reconstructed functions must
+        # reference one and the same cell instead of copies.
+        def make():
+            count = 0
+
+            def read():
+                return count
+
+            def write(value):
+                nonlocal count
+                count = value
+
+            return read, write
+
+        read, write = pickle_depickle(make(), protocol=self.protocol)
+        self.assertIs(read.__closure__[0], write.__closure__[0])
+        write(7)
+        self.assertEqual(read(), 7)
+
+        # A single function referencing the same cell more than once must
+        # also keep a unique cell.
+        def make_multi_ref():
+            value = 1
+
+            def f():
+                return value + value
+
+            def set_value(new_value):
+                nonlocal value
+                value = new_value
+
+            return f, set_value
+
+        f, set_value = pickle_depickle(
+            make_multi_ref(), protocol=self.protocol
+        )
+        self.assertEqual(len(f.__closure__), 1)
+        set_value(10)
+        self.assertEqual(f(), 20)
+
+        # Distinct cells containing equal values must not be merged.
+        def make_distinct_equal_cells():
+            a = [1]
+            b = [1]
+
+            def get_a():
+                return a
+
+            def get_b():
+                return b
+
+            return get_a, get_b
+
+        get_a, get_b = pickle_depickle(
+            make_distinct_equal_cells(), protocol=self.protocol
+        )
+        self.assertIsNot(get_a.__closure__[0], get_b.__closure__[0])
+        get_a().append(2)
+        self.assertEqual(get_b(), [1])
+
+        # Closures associated indirectly through a container holding their
+        # shared cell must still observe rebinding through the cell.
+        def make_shared_cell_in_container():
+            value = 5
+
+            def getter():
+                return value
+
+            def setter(new_value):
+                nonlocal value
+                value = new_value
+
+            return getter, setter, getter.__closure__[0]
+
+        getter, setter, cell = pickle_depickle(
+            make_shared_cell_in_container(), protocol=self.protocol
+        )
+        self.assertIs(cell, getter.__closure__[0])
+        setter(99)
+        self.assertEqual(getter(), 99)
+        self.assertEqual(cell.cell_contents, 99)
+
     def test_class_no_firstlineno_deletion_(self):
         # `__firstlineno__` is a new attribute of classes introduced in Python 3.13.
         # This attribute used to be automatically deleted when unpickling a class as a
@@ -3178,6 +3263,29 @@ def test_module_level_pickler():
     # cloudpickle.Pickler
     assert hasattr(cloudpickle, "Pickler")
     assert cloudpickle.Pickler is cloudpickle.CloudPickler
+
+
+@pytest.mark.parametrize("protocol", [4, 5])
+def test_shared_closure_cell_roundtrip(protocol):
+    # Minimal regression test: the read and write closures share a single
+    # free variable cell. After the round trip, rebinding the variable from
+    # write must be visible from read, for both pickle protocols 4 and 5.
+    def make():
+        count = 0
+
+        def read():
+            return count
+
+        def write(value):
+            nonlocal count
+            count = value
+
+        return read, write
+
+    read, write = pickle_depickle(make(), protocol=protocol)
+    assert read.__closure__[0] is write.__closure__[0]
+    write(7)
+    assert read() == 7
 
 
 if __name__ == "__main__":
