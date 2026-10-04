@@ -1318,7 +1318,19 @@ class Pickler(pickle.Pickler):
         if func.__closure__ is None:
             closure = None
         else:
-            closure = tuple(_make_empty_cell() for _ in range(len(code.co_freevars)))
+            # Reuse the same placeholder cell for closure cells that are
+            # shared between several functions pickled within the same
+            # cloudpickle.Pickler session, so that the reconstructed
+            # functions keep sharing a single cell at unpickling time. The
+            # pickle memoizer relies on physical object identity, hence
+            # distinct cells with equal contents are never merged. The
+            # original cells are kept alive for the whole pickling session
+            # by the memoized functions that own them, so their ids cannot
+            # be recycled while this mapping is in use.
+            closure = tuple(
+                self.cells_ref.setdefault(id(cell), _make_empty_cell())
+                for cell in func.__closure__
+            )
 
         return code, base_globals, None, None, closure
 
@@ -1337,6 +1349,10 @@ class Pickler(pickle.Pickler):
         # sharing the same global namespace at pickling time also share
         # their global namespace at unpickling time.
         self.globals_ref = {}
+        # map closure cell ids to placeholder cells, to ensure that
+        # functions sharing the same closure cell at pickling time also
+        # share it at unpickling time.
+        self.cells_ref = {}
         self.proto = int(protocol)
 
     if not PYPY:

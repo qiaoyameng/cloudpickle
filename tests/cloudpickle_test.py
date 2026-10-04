@@ -335,6 +335,29 @@ class CloudPickleTest(unittest.TestCase):
         g = pickle_depickle(f(), protocol=self.protocol)
         self.assertEqual(g(), 2)
 
+    def test_shared_closure_cell_preserved(self):
+        # Functions sharing a closure cell must keep sharing a single cell
+        # once depickled, so that rebinding a nonlocal variable through one
+        # function is visible to the others.
+        def make_counter():
+            count = 0
+
+            def read():
+                return count
+
+            def write(value):
+                nonlocal count
+                count = value
+
+            return read, write
+
+        for protocol in (4, 5):
+            read, write = make_counter()
+            read, write = pickle_depickle((read, write), protocol=protocol)
+            write(7)
+            self.assertEqual(read(), 7)
+            self.assertIs(read.__closure__[0], write.__closure__[0])
+
     def test_class_no_firstlineno_deletion_(self):
         # `__firstlineno__` is a new attribute of classes introduced in Python 3.13.
         # This attribute used to be automatically deleted when unpickling a class as a
