@@ -4,6 +4,10 @@ In development
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 
+- Add optional, explicit source bundles for dynamic functions and classes so
+  that restored tracebacks and introspection can display the supplied source
+  code without re-executing it.
+
 3.1.2
 =====
 

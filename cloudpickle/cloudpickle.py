@@ -55,13 +55,17 @@ from collections import ChainMap, OrderedDict
 import abc
 import builtins
 import copyreg
+import contextvars
 import dataclasses
 import dis
 from enum import Enum
+import hashlib
 import io
 import itertools
+import linecache
 import logging
 import opcode
+import os
 import pickle
 from pickle import _getattribute as _pickle_getattribute
 import platform
@@ -84,6 +88,11 @@ from types import CellType  # noqa: F401
 # communication speed over compatibility:
 DEFAULT_PROTOCOL = pickle.HIGHEST_PROTOCOL
 
+# Maximum total size, in UTF-8 bytes, of source code explicitly attached to a
+# pickle payload. Source code is only attached when the caller provides a
+# source_bundle mapping.
+DEFAULT_SOURCE_BUNDLE_BYTES = 10 * 1024 * 1024
+
 # Names of modules whose resources should be treated as dynamic.
 _PICKLE_BY_VALUE_MODULES = set()
 
@@ -102,6 +111,170 @@ if PYPY:
     builtin_code_type = type(float.__new__.__code__)
 
 _extract_code_globals_cache = weakref.WeakKeyDictionary()
+
+_active_source_bundle = contextvars.ContextVar("cloudpickle_source_bundle")
+_virtual_source_lock = threading.Lock()
+_virtual_source_registry = {}
+
+
+class _SourceBundle(dict):
+    """Mapping of source filenames to source text supplied by the caller."""
+
+    def __reduce__(self):
+        return _load_source_bundle, (dict(self),)
+
+
+class _InstalledSourceBundle(dict):
+    """Mapping of original filenames to receiver-local virtual filenames."""
+
+
+def _normalize_source_bundle(source_bundle, max_source_bytes):
+    if source_bundle is None:
+        return None
+    if isinstance(max_source_bytes, bool) or not isinstance(
+        max_source_bytes, int
+    ):
+        raise TypeError("max_source_bytes must be an integer")
+    if max_source_bytes < 0:
+        raise ValueError("max_source_bytes must be non-negative")
+    if not hasattr(source_bundle, "items"):
+        raise TypeError("source_bundle must be a mapping of filenames to source")
+    if isinstance(source_bundle, _SourceBundle):
+        normalized = dict(source_bundle)
+    else:
+        normalized = {}
+
+    unique_sources = {}
+    total_size = 0
+    for filename, source in source_bundle.items():
+        filename = os.fsdecode(os.fspath(filename))
+        if not filename:
+            raise ValueError("source_bundle filenames must be non-empty")
+        if filename in normalized:
+            raise ValueError(f"duplicate source filename: {filename}")
+
+        if isinstance(source, bytes):
+            try:
+                source = source.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise pickle.PicklingError(
+                    f"source for {filename} is not valid UTF-8"
+                ) from exc
+        elif not isinstance(source, str):
+            raise TypeError("source_bundle values must be strings or bytes")
+
+        if not isinstance(source_bundle, _SourceBundle):
+            source_size = len(source.encode("utf-8"))
+            if source not in unique_sources:
+                total_size += source_size
+                if total_size > max_source_bytes:
+                    raise pickle.PicklingError(
+                        "source_bundle exceeds the maximum source size of "
+                        f"{max_source_bytes} bytes"
+                    )
+            source = unique_sources.setdefault(source, source)
+        normalized[filename] = source
+
+    if not normalized:
+        return None
+    return _SourceBundle(normalized)
+
+
+def _validate_code_source(code, source_bundle):
+    source = source_bundle.get(code.co_filename)
+    if source is None:
+        return
+
+    line_count = len(source.splitlines())
+    code_name = getattr(code, "co_qualname", code.co_name)
+    line_numbers = {code.co_firstlineno}
+    line_numbers.update(line for _, line in dis.findlinestarts(code))
+    for line_number in line_numbers:
+        if line_number < 1:
+            continue
+        if line_number > line_count:
+            raise pickle.PicklingError(
+                f"source for {code.co_filename} does not contain line "
+                f"{line_number} used by {code_name}"
+            )
+
+
+def _virtual_source_filename(filename, source):
+    source_bytes = source.encode("utf-8")
+    filename_digest = hashlib.sha256(
+        filename.encode("utf-8", "surrogateescape")
+    ).hexdigest()[:12]
+    source_digest = hashlib.sha256(source_bytes).hexdigest()[:12]
+    base_name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    safe_base_name = "".join(
+        character
+        for character in base_name
+        if character.isalnum() or character in ".-_"
+    )
+    if not safe_base_name:
+        safe_base_name = "source.py"
+    elif "." not in safe_base_name:
+        safe_base_name += ".py"
+
+    stem, separator, extension = safe_base_name.rpartition(".")
+    if not separator:
+        stem, extension = safe_base_name, "py"
+
+    with _virtual_source_lock:
+        counter = 0
+        while True:
+            suffix = "" if counter == 0 else f"-{counter}"
+            virtual_filename = (
+                "<cloudpickle-source:"
+                f"{filename_digest}-{source_digest}{suffix}:{stem}.{extension}>"
+            )
+            owned = _virtual_source_registry.get(virtual_filename)
+            current_entry = linecache.cache.get(virtual_filename)
+            if (
+                owned == (filename_digest, source_digest)
+                and current_entry is not None
+            ):
+                return virtual_filename
+            if (
+                current_entry is None
+                and not os.path.exists(virtual_filename)
+                and virtual_filename not in linecache.cache
+            ):
+                linecache.cache[virtual_filename] = (
+                    len(source_bytes),
+                    None,
+                    source.splitlines(keepends=True),
+                    virtual_filename,
+                )
+                _virtual_source_registry[virtual_filename] = (
+                    filename_digest,
+                    source_digest,
+                )
+                return virtual_filename
+            counter += 1
+
+
+def _load_source_bundle(sources):
+    installed = _InstalledSourceBundle()
+    for filename, source in sources.items():
+        installed[filename] = _virtual_source_filename(filename, source)
+    return installed
+
+
+def _remap_code_filenames(code, source_bundle):
+    virtual_filename = source_bundle.get(code.co_filename)
+    remapped_consts = tuple(
+        _remap_code_filenames(constant, source_bundle)
+        if isinstance(constant, types.CodeType)
+        else constant
+        for constant in code.co_consts
+    )
+    if virtual_filename is None and remapped_consts == code.co_consts:
+        return code
+    return code.replace(
+        co_filename=virtual_filename or code.co_filename,
+        co_consts=remapped_consts,
+    )
 
 
 def _get_or_create_tracker_id(class_def):
@@ -517,9 +690,11 @@ class _empty_cell_value:
         return cls.__name__
 
 
-def _make_function(code, globals, name, argdefs, closure):
+def _make_function(code, globals, name, argdefs, closure, source_bundle=None):
     # Setting __builtins__ in globals is needed for nogil CPython.
     globals["__builtins__"] = __builtins__
+    if source_bundle is not None:
+        code = _remap_code_filenames(code, source_bundle)
     return types.FunctionType(code, globals, name, argdefs, closure)
 
 
@@ -540,7 +715,7 @@ def _make_cell(value=_empty_cell_value):
 
 
 def _make_skeleton_class(
-    type_constructor, name, bases, type_kwargs, class_tracker_id, extra
+    type_constructor, name, bases, type_kwargs, class_tracker_id, extra=None
 ):
     """Build dynamic class with an empty __dict__ to be filled once memoized
 
@@ -565,7 +740,7 @@ def _make_skeleton_class(
 
 
 def _make_skeleton_enum(
-    bases, name, qualname, members, module, class_tracker_id, extra
+    bases, name, qualname, members, module, class_tracker_id, extra=None
 ):
     """Build dynamic enum with an empty __dict__ to be filled once memoized
 
@@ -847,7 +1022,12 @@ def _code_reduce(obj):
     # the payload deterministic, independent of where the function is defined
     # which is especially useful when defining classes in jupyter/ipython
     # cells which do not have a deterministic filename.
-    co_filename = "".join("<dynamic-code>")
+    source_bundle = _active_source_bundle.get(None)
+    if source_bundle is not None and obj.co_filename in source_bundle:
+        _validate_code_source(obj, source_bundle)
+        co_filename = "".join(obj.co_filename)
+    else:
+        co_filename = "".join("<dynamic-code>")
 
     # Create shallow copies of these tuple to make cloudpickle payload deterministic.
     # When creating a code object during load, copies of these four tuples are
@@ -1053,7 +1233,7 @@ def _weakset_reduce(obj):
     return weakref.WeakSet, (list(obj),)
 
 
-def _dynamic_class_reduce(obj):
+def _dynamic_class_reduce(obj, source_bundle=None):
     """Save a class that can't be referenced as a module attribute.
 
     This method is used to serialize classes that are defined inside
@@ -1063,7 +1243,7 @@ def _dynamic_class_reduce(obj):
     if Enum is not None and issubclass(obj, Enum):
         return (
             _make_skeleton_enum,
-            _enum_getnewargs(obj),
+            _enum_getnewargs(obj)[:-1] + (source_bundle,),
             _enum_getstate(obj),
             None,
             None,
@@ -1072,7 +1252,7 @@ def _dynamic_class_reduce(obj):
     else:
         return (
             _make_skeleton_class,
-            _class_getnewargs(obj),
+            _class_getnewargs(obj)[:-1] + (source_bundle,),
             _class_getstate(obj),
             None,
             None,
@@ -1091,7 +1271,7 @@ def _class_reduce(obj):
     elif obj in _BUILTIN_TYPE_NAMES:
         return _builtin_type, (_BUILTIN_TYPE_NAMES[obj],)
     elif not _should_pickle_by_reference(obj):
-        return _dynamic_class_reduce(obj)
+        return _dynamic_class_reduce
     return NotImplemented
 
 
@@ -1320,24 +1500,45 @@ class Pickler(pickle.Pickler):
         else:
             closure = tuple(_make_empty_cell() for _ in range(len(code.co_freevars)))
 
-        return code, base_globals, None, None, closure
+        newargs = code, base_globals, None, None, closure
+        if self.source_bundle is not None:
+            newargs += (self.source_bundle,)
+        return newargs
 
     def dump(self, obj):
+        token = _active_source_bundle.set(self.source_bundle)
         try:
-            return super().dump(obj)
-        except RecursionError as e:
-            msg = "Could not pickle object as excessively deep recursion required."
-            raise pickle.PicklingError(msg) from e
+            try:
+                return super().dump(obj)
+            except RecursionError as e:
+                msg = (
+                    "Could not pickle object as excessively deep recursion "
+                    "required."
+                )
+                raise pickle.PicklingError(msg) from e
+        finally:
+            _active_source_bundle.reset(token)
 
-    def __init__(self, file, protocol=None, buffer_callback=None):
+    def __init__(
+        self,
+        file,
+        protocol=None,
+        buffer_callback=None,
+        source_bundle=None,
+        max_source_bytes=DEFAULT_SOURCE_BUNDLE_BYTES,
+    ):
         if protocol is None:
             protocol = DEFAULT_PROTOCOL
+        source_bundle = _normalize_source_bundle(
+            source_bundle, max_source_bytes
+        )
         super().__init__(file, protocol=protocol, buffer_callback=buffer_callback)
         # map functions __globals__ attribute ids, to ensure that functions
         # sharing the same global namespace at pickling time also share
         # their global namespace at unpickling time.
         self.globals_ref = {}
         self.proto = int(protocol)
+        self.source_bundle = source_bundle
 
     if not PYPY:
         # pickle.Pickler is the C implementation of the CPython pickler and
@@ -1404,7 +1605,10 @@ class Pickler(pickle.Pickler):
                 is_anyclass = False
 
             if is_anyclass:
-                return _class_reduce(obj)
+                reduced = _class_reduce(obj)
+                if reduced is _dynamic_class_reduce:
+                    return reduced(obj, self.source_bundle)
+                return reduced
             elif isinstance(obj, types.FunctionType):
                 return self._function_reduce(obj)
             else:
@@ -1472,7 +1676,9 @@ class Pickler(pickle.Pickler):
             if name is not None:
                 super().save_global(obj, name=name)
             elif not _should_pickle_by_reference(obj, name=name):
-                self._save_reduce_pickle5(*_dynamic_class_reduce(obj), obj=obj)
+                self._save_reduce_pickle5(
+                    *_dynamic_class_reduce(obj, self.source_bundle), obj=obj
+                )
             else:
                 super().save_global(obj, name=name)
 
@@ -1524,8 +1730,19 @@ class Pickler(pickle.Pickler):
 # Shorthands similar to pickle.dump/pickle.dumps
 
 
-def dump(obj, file, protocol=None, buffer_callback=None):
+def dump(
+    obj,
+    file,
+    protocol=None,
+    buffer_callback=None,
+    source_bundle=None,
+    max_source_bytes=DEFAULT_SOURCE_BUNDLE_BYTES,
+):
     """Serialize obj as bytes streamed into file
+
+    source_bundle is an optional explicit mapping from source filenames to
+    UTF-8 source text. It is attached to dynamic functions and classes for
+    traceback and inspect display; source is never executed.
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
     pickle.HIGHEST_PROTOCOL. This setting favors maximum communication
@@ -1537,11 +1754,27 @@ def dump(obj, file, protocol=None, buffer_callback=None):
     implementation details that can change from one Python version to the
     next).
     """
-    Pickler(file, protocol=protocol, buffer_callback=buffer_callback).dump(obj)
+    Pickler(
+        file,
+        protocol=protocol,
+        buffer_callback=buffer_callback,
+        source_bundle=source_bundle,
+        max_source_bytes=max_source_bytes,
+    ).dump(obj)
 
 
-def dumps(obj, protocol=None, buffer_callback=None):
+def dumps(
+    obj,
+    protocol=None,
+    buffer_callback=None,
+    source_bundle=None,
+    max_source_bytes=DEFAULT_SOURCE_BUNDLE_BYTES,
+):
     """Serialize obj as a string of bytes allocated in memory
+
+    source_bundle is an optional explicit mapping from source filenames to
+    UTF-8 source text. It is attached to dynamic functions and classes for
+    traceback and inspect display; source is never executed.
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
     pickle.HIGHEST_PROTOCOL. This setting favors maximum communication
@@ -1554,7 +1787,13 @@ def dumps(obj, protocol=None, buffer_callback=None):
     next).
     """
     with io.BytesIO() as file:
-        cp = Pickler(file, protocol=protocol, buffer_callback=buffer_callback)
+        cp = Pickler(
+            file,
+            protocol=protocol,
+            buffer_callback=buffer_callback,
+            source_bundle=source_bundle,
+            max_source_bytes=max_source_bytes,
+        )
         cp.dump(obj)
         return file.getvalue()
 
