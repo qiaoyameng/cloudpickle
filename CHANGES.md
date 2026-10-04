@@ -1,6 +1,14 @@
 In development
 ==============
 
+- Add an optional ``source_bundle`` parameter to ``cloudpickle.dump``,
+  ``cloudpickle.dumps`` and ``cloudpickle.Pickler``: a caller-provided
+  mapping of filenames to their source text that is attached to the payload
+  of pickled dynamic functions and classes and registered in linecache at
+  unpickling time, so that tracebacks and inspect can display source lines
+  on processes where those files are not available. The bundled source is
+  only used for display purposes and is never re-executed.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

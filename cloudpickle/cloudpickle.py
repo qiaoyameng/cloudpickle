@@ -58,9 +58,12 @@ import copyreg
 import dataclasses
 import dis
 from enum import Enum
+import hashlib
 import io
 import itertools
+import linecache
 import logging
+import os
 import opcode
 import pickle
 from pickle import _getattribute as _pickle_getattribute
@@ -68,6 +71,7 @@ import platform
 import struct
 import sys
 import threading
+import tokenize
 import types
 import typing
 import uuid
@@ -83,6 +87,12 @@ from types import CellType  # noqa: F401
 # communicating processes to run the same Python version hence we favor
 # communication speed over compatibility:
 DEFAULT_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
+# Default maximum cumulative size (in utf-8 encoded bytes) of the sources
+# accepted in a source bundle. This is a safeguard to avoid accidentally
+# shipping very large payloads: callers can raise or lower it via the
+# ``source_bundle_max_bytes`` parameter.
+_DEFAULT_SOURCE_BUNDLE_MAX_BYTES = 1_000_000
 
 # Names of modules whose resources should be treated as dynamic.
 _PICKLE_BY_VALUE_MODULES = set()
@@ -521,6 +531,137 @@ def _make_function(code, globals, name, argdefs, closure):
     # Setting __builtins__ in globals is needed for nogil CPython.
     globals["__builtins__"] = __builtins__
     return types.FunctionType(code, globals, name, argdefs, closure)
+
+
+def _normalize_source_bundle(source_bundle, max_bytes):
+    """Validate and normalize a user-provided source bundle mapping.
+
+    The bundle maps filenames (as found in the ``co_filename`` attribute of
+    the code objects being pickled) to their source text. Sources are only
+    taken from this explicit mapping: cloudpickle never reads files from
+    disk on its own to complete the bundle.
+    """
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError(
+            f"source_bundle_max_bytes should be a positive integer, "
+            f"got {max_bytes!r} instead"
+        )
+    normalized = {}
+    total_size = 0
+    for filename, source in source_bundle.items():
+        if not isinstance(filename, str):
+            raise TypeError(
+                f"source bundle filenames should be strings, got "
+                f"{type(filename).__name__} instead"
+            )
+        if isinstance(source, bytes):
+            # Honor the PEP 263 encoding cookie when present, defaulting to
+            # utf-8 as the Python parser does.
+            try:
+                encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+            except SyntaxError:
+                encoding = "utf-8"
+            try:
+                source = source.decode(encoding)
+            except UnicodeDecodeError as e:
+                raise ValueError(
+                    f"cannot decode the bundled source of {filename!r} with "
+                    f"encoding {encoding!r}"
+                ) from e
+        elif not isinstance(source, str):
+            raise TypeError(
+                f"source bundle values should be str or bytes, got "
+                f"{type(source).__name__} for {filename!r} instead"
+            )
+        total_size += len(source.encode("utf-8"))
+        if max_bytes is not None and total_size > max_bytes:
+            raise ValueError(
+                f"source bundle exceeds the total budget of {max_bytes} "
+                f"bytes (set source_bundle_max_bytes to a larger value or "
+                f"None to disable this check)"
+            )
+        normalized[filename] = source
+    return normalized
+
+
+def _check_source_line_coverage(co, source, filename):
+    """Check that a bundled source covers the line range of a code object."""
+    n_lines = len(source.splitlines())
+    first_lineno = co.co_firstlineno
+    last_lineno = first_lineno
+    if hasattr(co, "co_lines"):
+        for _, _, lineno in co.co_lines():
+            if lineno is not None and lineno > last_lineno:
+                last_lineno = lineno
+    if not 1 <= first_lineno <= n_lines or last_lineno > n_lines:
+        raise ValueError(
+            f"the bundled source of {filename!r} has {n_lines} lines but "
+            f"code object {getattr(co, 'co_qualname', co.co_name)!r} spans lines "
+            f"{first_lineno}-{last_lineno}"
+        )
+
+
+def _register_source_in_linecache(filename, source):
+    """Register a bundled source in linecache, return the filename to use.
+
+    The source is registered for display purposes only (tracebacks and
+    inspect): it is never executed to reconstruct the pickled objects.
+
+    If the original filename is already taken on this process, either in
+    linecache or on disk, with different content, an independent virtual
+    filename is allocated instead of overwriting the existing entry.
+    """
+    lines = source.splitlines(keepends=True)
+    if filename in linecache.cache or os.path.exists(filename):
+        try:
+            existing_lines = linecache.getlines(filename)
+        except Exception:
+            existing_lines = None
+        if existing_lines == lines:
+            # The exact same content is already available under this
+            # filename: reuse it as-is.
+            return filename
+    else:
+        # mtime=None makes this entry immune to linecache.checkcache.
+        linecache.cache[filename] = (len(source), None, lines, filename)
+        return filename
+    # The filename is already taken by different content (e.g. a file of a
+    # different package with the same name): allocate an independent
+    # virtual filename to avoid clobbering the existing linecache entry.
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    basename = os.path.basename(filename) or "source.py"
+    counter = 0
+    while True:
+        suffix = f"-{counter}" if counter else ""
+        virtual_filename = f"<cloudpickle-source-bundle:{digest}{suffix}>/{basename}"
+        entry = linecache.cache.get(virtual_filename)
+        if entry is None and not os.path.exists(virtual_filename):
+            linecache.cache[virtual_filename] = (
+                len(source),
+                None,
+                lines,
+                virtual_filename,
+            )
+            return virtual_filename
+        if entry is not None and len(entry) == 4 and entry[2] == lines:
+            # The same content was already registered under this virtual
+            # filename by a previous unpickling round.
+            return virtual_filename
+        counter += 1
+
+
+def _make_code_with_source(code_args, filename_index, original_filename, source):
+    """Reconstruct a code object and register its bundled source.
+
+    The code object is rebuilt from the pickled constructor arguments: its
+    bytecode is never recompiled from the bundled source. The source is only
+    registered in linecache so that tracebacks and inspect can display it.
+    """
+    filename = _register_source_in_linecache(original_filename, source)
+    code_args = (
+        code_args[:filename_index] + (filename,) + code_args[filename_index + 1 :]
+    )
+    return types.CodeType(*code_args)
 
 
 def _make_empty_cell():
@@ -1289,6 +1430,29 @@ class Pickler(pickle.Pickler):
         else:
             return self._dynamic_function_reduce(obj)
 
+    def _code_reduce_with_source(self, obj):
+        """Code object reducer that attaches bundled source when available.
+
+        Only filenames explicitly present in the user-provided source bundle
+        are attached: files are never read from disk to complete the bundle.
+        Nested code objects (stored in co_consts) are reduced recursively
+        through this same method, so their own file references are handled
+        too. The same source string object is attached at most once per
+        pickle payload thanks to pickle's memoization.
+        """
+        source = self.source_bundle.get(obj.co_filename)
+        if source is None:
+            return _code_reduce(obj)
+        _check_source_line_coverage(obj, source, obj.co_filename)
+        _, args = _code_reduce(obj)
+        # Position of co_filename in the CodeType constructor arguments:
+        # it is 10 for all CPython versions and 11 for the "nogil" variant.
+        filename_index = 11 if hasattr(obj, "co_nmeta") else 10
+        return (
+            _make_code_with_source,
+            (args, filename_index, obj.co_filename, source),
+        )
+
     def _function_getnewargs(self, func):
         code = func.__code__
 
@@ -1329,7 +1493,14 @@ class Pickler(pickle.Pickler):
             msg = "Could not pickle object as excessively deep recursion required."
             raise pickle.PicklingError(msg) from e
 
-    def __init__(self, file, protocol=None, buffer_callback=None):
+    def __init__(
+        self,
+        file,
+        protocol=None,
+        buffer_callback=None,
+        source_bundle=None,
+        source_bundle_max_bytes=None,
+    ):
         if protocol is None:
             protocol = DEFAULT_PROTOCOL
         super().__init__(file, protocol=protocol, buffer_callback=buffer_callback)
@@ -1338,6 +1509,13 @@ class Pickler(pickle.Pickler):
         # their global namespace at unpickling time.
         self.globals_ref = {}
         self.proto = int(protocol)
+        if source_bundle is not None:
+            if source_bundle_max_bytes is None:
+                source_bundle_max_bytes = _DEFAULT_SOURCE_BUNDLE_MAX_BYTES
+            source_bundle = _normalize_source_bundle(
+                source_bundle, source_bundle_max_bytes
+            )
+        self.source_bundle = source_bundle
 
     if not PYPY:
         # pickle.Pickler is the C implementation of the CPython pickler and
@@ -1407,6 +1585,8 @@ class Pickler(pickle.Pickler):
                 return _class_reduce(obj)
             elif isinstance(obj, types.FunctionType):
                 return self._function_reduce(obj)
+            elif self.source_bundle is not None and isinstance(obj, types.CodeType):
+                return self._code_reduce_with_source(obj)
             else:
                 # fallback to save_global, including the Pickler's
                 # dispatch_table
@@ -1478,6 +1658,19 @@ class Pickler(pickle.Pickler):
 
         dispatch[type] = save_global
 
+        def save_code(self, obj):
+            """Registered with the dispatch to handle code objects.
+
+            Attach bundled source to code objects whose filename is present
+            in the pickler's source bundle, if any.
+            """
+            if self.source_bundle is not None:
+                return self.save_reduce(*self._code_reduce_with_source(obj), obj=obj)
+            else:
+                return self.save_reduce(*_code_reduce(obj), obj=obj)
+
+        dispatch[types.CodeType] = save_code
+
         def save_function(self, obj, name=None):
             """Registered with the dispatch to handle all function types.
 
@@ -1524,7 +1717,14 @@ class Pickler(pickle.Pickler):
 # Shorthands similar to pickle.dump/pickle.dumps
 
 
-def dump(obj, file, protocol=None, buffer_callback=None):
+def dump(
+    obj,
+    file,
+    protocol=None,
+    buffer_callback=None,
+    source_bundle=None,
+    source_bundle_max_bytes=None,
+):
     """Serialize obj as bytes streamed into file
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1536,11 +1736,35 @@ def dump(obj, file, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    source_bundle is an optional mapping of filenames to their source text
+    (str, or bytes with an optional encoding cookie). When provided, the
+    source of the files that define the pickled functions and classes is
+    attached to the payload and registered in linecache at unpickling time,
+    so that tracebacks and inspect can display the source lines on processes
+    where those files are not available. The source is only used for display
+    purposes: the unpickled objects still execute the pickled code objects
+    and the source is never re-executed. Only the files explicitly listed in
+    the mapping are attached: cloudpickle never reads files from disk on its
+    own. The cumulative size of the bundled sources is limited to
+    source_bundle_max_bytes (1 MB by default).
     """
-    Pickler(file, protocol=protocol, buffer_callback=buffer_callback).dump(obj)
+    Pickler(
+        file,
+        protocol=protocol,
+        buffer_callback=buffer_callback,
+        source_bundle=source_bundle,
+        source_bundle_max_bytes=source_bundle_max_bytes,
+    ).dump(obj)
 
 
-def dumps(obj, protocol=None, buffer_callback=None):
+def dumps(
+    obj,
+    protocol=None,
+    buffer_callback=None,
+    source_bundle=None,
+    source_bundle_max_bytes=None,
+):
     """Serialize obj as a string of bytes allocated in memory
 
     protocol defaults to cloudpickle.DEFAULT_PROTOCOL which is an alias to
@@ -1552,9 +1776,18 @@ def dumps(obj, protocol=None, buffer_callback=None):
     guaranteed to work because cloudpickle relies on some internal
     implementation details that can change from one Python version to the
     next).
+
+    See cloudpickle.dump for the documentation of the source_bundle and
+    source_bundle_max_bytes parameters.
     """
     with io.BytesIO() as file:
-        cp = Pickler(file, protocol=protocol, buffer_callback=buffer_callback)
+        cp = Pickler(
+            file,
+            protocol=protocol,
+            buffer_callback=buffer_callback,
+            source_bundle=source_bundle,
+            source_bundle_max_bytes=source_bundle_max_bytes,
+        )
         cp.dump(obj)
         return file.getvalue()
 
