@@ -1,6 +1,14 @@
 In development
 ==============
 
+- Add a protocol 5 out-of-band buffer bundle API: ``dumps_bundle`` returns a
+  small pickle stream, an ordered buffer manifest (id, length, SHA-256 digest
+  and read-only flag) and iterable buffer chunks; ``loads_bundle`` fetches
+  chunks by id through a caller-provided callback, verifies missing chunks,
+  ordering, tampering and a total-size cap before unpickling, and supports a
+  zero-copy mode whose lifetime is owned by the returned holder/context
+  manager. ``dumps``/``loads`` are unchanged and no NumPy dependency is
+  introduced.
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

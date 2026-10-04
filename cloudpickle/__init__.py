@@ -1,5 +1,18 @@
 from . import cloudpickle
 from .cloudpickle import *  # noqa
+from .bundle import (
+    BufferChunk,
+    BufferManifestEntry,
+    BundleError,
+    BundleSizeLimitError,
+    BufferIntegrityError,
+    BufferOrderError,
+    MissingBufferError,
+    PickleBundle,
+    WritableZeroCopyError,
+    dumps_bundle,
+    loads_bundle,
+)
 
 __doc__ = cloudpickle.__doc__
 
@@ -15,4 +28,15 @@ __all__ = [  # noqa
     "load",
     "register_pickle_by_value",
     "unregister_pickle_by_value",
+    "dumps_bundle",
+    "loads_bundle",
+    "PickleBundle",
+    "BufferChunk",
+    "BufferManifestEntry",
+    "BundleError",
+    "MissingBufferError",
+    "BufferOrderError",
+    "BufferIntegrityError",
+    "BundleSizeLimitError",
+    "WritableZeroCopyError",
 ]
