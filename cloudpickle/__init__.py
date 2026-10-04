@@ -8,6 +8,7 @@ __version__ = "3.2.0.dev0"
 __all__ = [  # noqa
     "__version__",
     "Pickler",
+    "ModulePolicy",
     "CloudPickler",
     "dumps",
     "loads",

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import types
 import unittest
 import weakref
@@ -3178,6 +3179,448 @@ def test_module_level_pickler():
     # cloudpickle.Pickler
     assert hasattr(cloudpickle, "Pickler")
     assert cloudpickle.Pickler is cloudpickle.CloudPickler
+
+
+class _TemporaryModule:
+    def __init__(self, name, source=""):
+        self.name = name
+        self.module = types.ModuleType(name)
+        self.module.__file__ = f"<{name}>"
+        package, _, attribute = name.rpartition(".")
+        if package:
+            self.module.__package__ = package
+        exec(compile(source, f"<{name}>", "exec"), self.module.__dict__)
+
+    def __enter__(self):
+        sys.modules[self.name] = self.module
+        parent_name, _, child_name = self.name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        self._had_parent_attribute = parent is not None and hasattr(
+            parent, child_name
+        )
+        if parent is not None and not self._had_parent_attribute:
+            setattr(parent, child_name, self.module)
+        return self.module
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        parent_name, _, child_name = self.name.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None and not self._had_parent_attribute:
+            delattr(parent, child_name)
+        sys.modules.pop(self.name, None)
+
+
+def _dump_with_pickler(obj, **pickler_kwargs):
+    file = io.BytesIO()
+    cloudpickle.Pickler(file, **pickler_kwargs).dump(obj)
+    return file.getvalue()
+
+
+def _uses_stack_global(data, module_name=None, qualname=None):
+    operations = list(pickletools.genops(io.BytesIO(data)))
+    memo = {}
+    memo_index = 0
+    last_string = None
+    for opcode_info, argument, position in operations:
+        if opcode_info.name in {"SHORT_BINUNICODE", "BINUNICODE", "STRING"}:
+            last_string = argument
+        elif opcode_info.name == "MEMOIZE":
+            memo[memo_index] = last_string
+            memo_index += 1
+            last_string = None
+
+    for index, (opcode_info, argument, position) in enumerate(operations):
+        if opcode_info.name != "STACK_GLOBAL":
+            continue
+        arguments = []
+        previous_ops = operations[:index]
+        for previous_opcode, previous_argument, _ in reversed(previous_ops):
+            string_opcodes = {"SHORT_BINUNICODE", "BINUNICODE", "STRING"}
+            if previous_opcode.name in string_opcodes:
+                arguments.append(previous_argument)
+            elif previous_opcode.name == "BINGET":
+                arguments.append(memo[previous_argument])
+            if len(arguments) == 2:
+                break
+        actual_qualname, actual_module = arguments
+        if module_name is None or actual_module == module_name:
+            if qualname is None or actual_qualname == qualname:
+                return True
+    return False
+
+
+def _uses_subimport(data):
+    return b"\x8c\x09subimport" in data
+
+
+def _uses_dynamic_subimport(data):
+    return b"dynamic_subimport" in data
+
+
+def test_pickler_module_policy_covers_functions_classes_modules_and_typevars():
+    source = textwrap.dedent(
+        """
+        import typing
+
+        def local_function():
+            return "function"
+
+        class LocalClass:
+            def method(self):
+                return "class"
+
+        LocalT = typing.TypeVar("LocalT")
+        """
+    )
+    with _TemporaryModule("tmp_policy_module", source) as module:
+        by_value = _dump_with_pickler(
+            [
+                module,
+                module.local_function,
+                module.LocalClass,
+                module.LocalT,
+            ],
+            module_policy={module: cloudpickle.ModulePolicy.BY_VALUE},
+        )
+        assert not _uses_stack_global(by_value, module.__name__)
+        assert _uses_dynamic_subimport(by_value)
+        assert b"_make_typevar" in by_value
+
+        by_reference = _dump_with_pickler(
+            [
+                module,
+                module.local_function,
+                module.LocalClass,
+                module.LocalT,
+            ],
+            module_policy={module: cloudpickle.ModulePolicy.BY_REFERENCE},
+        )
+        assert _uses_stack_global(
+            by_reference, module.__name__, "local_function"
+        )
+        assert _uses_stack_global(by_reference, module.__name__, "LocalClass")
+        assert b"_make_typevar" not in by_reference
+        assert _uses_subimport(by_reference)
+
+        default = _dump_with_pickler(
+            [module.local_function, module.LocalClass, module.LocalT, module]
+        )
+        assert _uses_stack_global(default, module.__name__, "local_function")
+        assert _uses_subimport(default)
+
+
+def test_pickler_module_policy_supports_more_specific_submodule_rules():
+    source = textwrap.dedent(
+        """
+        import typing
+
+        def package_function():
+            return "package"
+
+        class PackageClass:
+            pass
+
+        PackageT = typing.TypeVar("PackageT")
+        """
+    )
+    sub_source = textwrap.dedent(
+        """
+        import typing
+
+        def submodule_function():
+            return "submodule"
+
+        class SubmoduleClass:
+            pass
+
+        SubmoduleT = typing.TypeVar("SubmoduleT")
+        """
+    )
+    with _TemporaryModule("tmp_specific_policy", source) as package:
+        package.__path__ = []
+        with _TemporaryModule(
+            "tmp_specific_policy.sub", sub_source
+        ) as submodule:
+            data = _dump_with_pickler(
+                [
+                    package.package_function,
+                    package.PackageClass,
+                    package.PackageT,
+                    submodule.submodule_function,
+                    submodule.SubmoduleClass,
+                    submodule.SubmoduleT,
+                ],
+                module_policy={
+                    package: cloudpickle.ModulePolicy.BY_VALUE,
+                    submodule: cloudpickle.ModulePolicy.BY_REFERENCE,
+                },
+            )
+            assert not _uses_stack_global(
+                data, package.__name__, "package_function"
+            )
+            assert _uses_stack_global(
+                data, submodule.__name__, "submodule_function"
+            )
+            assert _uses_stack_global(data, submodule.__name__, "SubmoduleClass")
+            result = pickle.loads(data)
+            assert result[5] is submodule.SubmoduleT
+
+
+def test_pickler_module_policy_methods_do_not_modify_global_registry():
+    source = """
+def local_function():
+    return "local"
+"""
+    with _TemporaryModule("tmp_instance_policy", source) as module:
+        file = io.BytesIO()
+        pickler = cloudpickle.Pickler(file)
+        pickler.register_pickle_by_value(module)
+        assert module.__name__ not in list_registry_pickle_by_value()
+        pickler.dump(module.local_function)
+        assert not _uses_stack_global(file.getvalue(), module.__name__)
+
+        file = io.BytesIO()
+        pickler = cloudpickle.Pickler(file)
+        pickler.register_pickle_by_reference(module)
+        pickler.dump(module.local_function)
+        assert _uses_stack_global(file.getvalue(), module.__name__)
+
+        file = io.BytesIO()
+        pickler = cloudpickle.Pickler(file)
+        pickler.register_pickle_by_value(module)
+        pickler.register_pickle_by_default(module)
+        pickler.dump(module.local_function)
+        assert _uses_stack_global(file.getvalue(), module.__name__)
+
+
+def test_pickler_module_policy_default_overrides_more_general_by_value():
+    source = """
+def local_function():
+    return "local"
+"""
+    with _TemporaryModule("tmp_default_policy", source) as module:
+        register_pickle_by_value(module)
+        try:
+            data = _dump_with_pickler(
+                module.local_function,
+                module_policy={
+                    module: cloudpickle.ModulePolicy.DEFAULT,
+                },
+            )
+            assert _uses_stack_global(data, module.__name__)
+        finally:
+            unregister_pickle_by_value(module)
+
+
+def test_pickler_module_policy_specific_default_overrides_parent_by_value():
+    source = """
+def parent_function():
+    return "parent"
+"""
+    sub_source = """
+def child_function():
+    return "child"
+"""
+    with _TemporaryModule("tmp_default_parent", source) as package:
+        package.__path__ = []
+        with _TemporaryModule("tmp_default_parent.sub", sub_source) as submodule:
+            data = _dump_with_pickler(
+                [package.parent_function, submodule.child_function],
+                module_policy={
+                    package: cloudpickle.ModulePolicy.BY_VALUE,
+                    submodule: cloudpickle.ModulePolicy.DEFAULT,
+                },
+            )
+            assert not _uses_stack_global(data, package.__name__)
+            assert _uses_stack_global(data, submodule.__name__)
+
+
+def test_pickler_module_policy_by_reference_does_not_fallback_to_by_value():
+    source = """
+def outer():
+    def nested():
+        return "nested"
+    return nested
+"""
+    with _TemporaryModule("tmp_reference_policy", source) as module:
+        with pytest.raises(Exception):
+            _dump_with_pickler(
+                module.outer(),
+                module_policy={
+                    module: cloudpickle.ModulePolicy.BY_REFERENCE,
+                },
+            )
+
+
+def test_pickler_module_policy_uses_identity_for_import_aliases():
+    source = """
+def aliased_function():
+    return "aliased"
+
+class AliasedClass:
+    pass
+"""
+    with _TemporaryModule("tmp_policy_actual", source) as module:
+        sys.modules["tmp_policy_import_alias"] = module
+
+        data = _dump_with_pickler(
+            module.aliased_function,
+            module_policy={
+                "tmp_policy_import_alias": cloudpickle.ModulePolicy.BY_VALUE
+            },
+        )
+        assert not _uses_stack_global(data, module.__name__)
+
+        module.aliased_function.__module__ = "tmp_policy_import_alias"
+        data = _dump_with_pickler(
+            module.aliased_function,
+            module_policy={module: cloudpickle.ModulePolicy.BY_VALUE},
+        )
+        assert not _uses_stack_global(data, module.__name__)
+
+
+def test_pickler_module_policy_keeps_shared_globals_recursion_and_class_graph():
+    source = textwrap.dedent(
+        """
+        def recursive(n):
+            return n if n <= 0 else recursive(n - 1)
+
+        def calls_recursive():
+            return recursive(2)
+        """
+    )
+    base_source = """
+class Base:
+    def value(self):
+        return 1
+"""
+    derived_source = """
+from tmp_cross_module_base import Base
+
+class Derived(Base):
+    def value(self):
+        return Base.value(self) + 1
+"""
+    with _TemporaryModule("tmp_shared_globals", source) as globals_module:
+        with _TemporaryModule(
+            "tmp_cross_module_base", base_source
+        ) as base_module:
+            with _TemporaryModule(
+                "tmp_cross_module_derived", derived_source
+            ) as d_mod:
+                data = _dump_with_pickler(
+                    [
+                        globals_module.recursive,
+                        globals_module.calls_recursive,
+                        base_module.Base,
+                        d_mod.Derived,
+                    ],
+                    module_policy={
+                        "tmp_shared_globals": cloudpickle.ModulePolicy.BY_VALUE,
+                        "tmp_cross_module_base": (
+                            cloudpickle.ModulePolicy.BY_VALUE
+                        ),
+                        "tmp_cross_module_derived": (
+                            cloudpickle.ModulePolicy.BY_VALUE
+                        ),
+                    },
+                )
+                recursive, calls_recursive, Base, Derived = pickle.loads(data)
+                assert recursive(2) == 0
+                assert calls_recursive() == 0
+                assert recursive.__globals__ is calls_recursive.__globals__
+                assert Derived().value() == 2
+                assert isinstance(Derived(), Base)
+
+
+class _ChangePolicyDuringDump:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __reduce__(self):
+        self.callback()
+        return (dict, ((),))
+
+
+def test_interleaved_picklers_use_independent_snapshots():
+    source_a = """
+def function_a():
+    return "a"
+"""
+    source_b = """
+def function_b():
+    return "b"
+"""
+    with _TemporaryModule("tmp_interleaved_a", source_a) as module_a:
+        with _TemporaryModule("tmp_interleaved_b", source_b) as module_b:
+            file_a = io.BytesIO()
+            file_b = io.BytesIO()
+            pickler_a = cloudpickle.Pickler(
+                file_a,
+                module_policy={module_a: cloudpickle.ModulePolicy.BY_VALUE},
+            )
+            pickler_b = cloudpickle.Pickler(
+                file_b,
+                module_policy={module_b: cloudpickle.ModulePolicy.BY_REFERENCE},
+            )
+
+            ready_a = threading.Event()
+            ready_b = threading.Event()
+            start_a = threading.Event()
+            start_b = threading.Event()
+            policy_changed = threading.Event()
+
+            def change_pickler_a():
+                pickler_a.set_module_policy(
+                    module_a, cloudpickle.ModulePolicy.BY_REFERENCE
+                )
+
+            def change_pickler_b():
+                register_pickle_by_value(module_b)
+
+            def dump_a():
+                pickler_a.dump(
+                    [
+                        _ChangePolicyDuringDump(
+                            lambda: (ready_a.set(), start_a.wait(5))
+                        ),
+                        module_a.function_a,
+                    ]
+                )
+
+            def dump_b():
+                pickler_b.dump(
+                    [
+                        _ChangePolicyDuringDump(
+                                lambda: (
+                                    ready_b.set(),
+                                    start_b.wait(5),
+                                    change_pickler_a(),
+                                    change_pickler_b(),
+                                    policy_changed.set(),
+                                )
+                        ),
+                        module_b.function_b,
+                    ]
+                )
+
+            thread_a = threading.Thread(target=dump_a)
+            thread_b = threading.Thread(target=dump_b)
+            thread_a.start()
+            thread_b.start()
+            assert ready_a.wait(5)
+            assert ready_b.wait(5)
+            start_b.set()
+            assert policy_changed.wait(5)
+            start_a.set()
+            thread_a.join(5)
+            thread_b.join(5)
+            assert not thread_a.is_alive()
+            assert not thread_b.is_alive()
+
+            assert not _uses_stack_global(file_a.getvalue(), module_a.__name__)
+            assert _uses_stack_global(file_b.getvalue(), module_b.__name__)
+            unregister_pickle_by_value(module_b)
 
 
 if __name__ == "__main__":

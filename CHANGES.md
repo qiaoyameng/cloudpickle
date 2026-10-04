@@ -1,6 +1,10 @@
 In development
 ==============
 
+- Add per-`Pickler` module policies to select pickling by value, by
+  reference, or the default behavior for a module and its submodules without
+  modifying the global registry.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

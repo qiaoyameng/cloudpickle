@@ -101,6 +101,31 @@ using the
 >>> cloudpickle.dumps(my_module.my_function)  # my_function is pickled by reference
 ```
 
+The global registry remains useful to change the default behavior of every
+pickler. For a local and concurrent-safe configuration, module policies can be
+set on an individual `Pickler`:
+
+```python
+>>> import io
+>>> import cloudpickle
+>>> import my_package
+>>> stream = io.BytesIO()
+>>> pickler = cloudpickle.Pickler(
+...     stream,
+...     module_policy={
+...         my_package: cloudpickle.ModulePolicy.BY_VALUE,
+...         my_package.third_party_plugin: cloudpickle.ModulePolicy.BY_REFERENCE,
+...     },
+... )
+>>> pickler.dump(my_package.my_function)
+
+```
+
+`ModulePolicy.DEFAULT` restores the usual rule for a more specific module, even
+if one of its parent packages is configured to be pickled by value. A pickler's
+policy is snapshotted when `dump()` starts and also covers functions, classes,
+TypeVars and module objects.
+
 Using this API, there is no need to re-install the new version of the module on
 all the worker nodes nor to restart the workers: restarting the client Python
 process with the new source code is enough.
