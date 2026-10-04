@@ -1,6 +1,15 @@
 In development
 ==============
 
+- Add a protocol 5 out-of-band buffer "bundle" API
+  (``dump_bundle``/``load_bundle``) that stores large ``PickleBuffer``
+  payloads in independent storage while keeping the main pickle stream small.
+  The manifest records each buffer's order, length, digest and read-only
+  constraint and is validated for missing chunks, ordering, tampering and a
+  total-size limit before the trusted pickle restore runs. Zero-copy lifetimes
+  are managed by the returned context manager; the regular ``dumps``/``loads``
+  functions are unchanged.
+
 - Make pickling of functions depending on globals in notebook more
   deterministic. ([PR#560](https://github.com/cloudpipe/cloudpickle/pull/560))
 

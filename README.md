@@ -120,6 +120,58 @@ situations:
 - If a function pickled by reference uses a function pickled by value during its execution.
 
 
+Out-of-band buffer bundles (protocol 5)
+---------------------------------------
+
+When the object graph carries large protocol 5 buffers (objects that expose a
+`pickle.PickleBuffer`, such as NumPy arrays), it is often desirable to keep
+those large payloads out of the main pickle stream and store them separately.
+`cloudpickle` provides a small "bundle" API for this. Only the Python standard
+library (`PickleBuffer` and `memoryview`) is needed; NumPy is not required.
+
+```python
+>>> import cloudpickle
+>>> from pickle import PickleBuffer
+
+>>> payload = bytearray(b"x" * 1_000_000)  # any buffer-protocol object
+>>> obj = {"data": PickleBuffer(payload), "meta": 42}
+
+>>> storage = {}  # anything addressable by id (object store, files, ...)
+>>> with cloudpickle.dump_bundle(obj) as bundle:
+...     main = bundle.main              # small pickle stream, no buffer data
+...     manifest = bundle.manifest      # order, length, digest, read-only
+...     for chunk_id, view in bundle:   # iterable buffer contents
+...         storage[chunk_id] = bytes(view)
+```
+
+On the receiving side, the caller provides a `get_chunk(chunk_id)` function.
+The loader checks the manifest for missing chunks, ordering, digest (content
+tampering) and a total-size limit, and honors the read-only constraint, all
+*before* running the trusted pickle restore:
+
+```python
+>>> def get_chunk(chunk_id):
+...     return storage[chunk_id]
+
+>>> with cloudpickle.load_bundle(main, manifest, get_chunk) as loaded:
+...     loaded.obj["meta"]
+...     bytes(loaded.obj["data"][:5])
+42
+b'xxxxx'
+```
+
+The returned context manager owns the zero-copy buffer lifetimes; borrowed
+buffers are released when the block exits. Pass `copy=True` to materialize
+independent writable copies instead. The regular `cloudpickle.dumps` and
+`cloudpickle.loads` functions are unchanged and still inline the buffers.
+
+Alias handling: when the *same underlying buffer* is referenced from several
+places, the manifest shares one chunk id and the restored object keeps views of
+the same memory. Two originally independent, writable buffers that merely
+contain equal bytes are never de-duplicated, so writing through one restored
+view can never mutate the other.
+
+
 Running the tests
 -----------------
 

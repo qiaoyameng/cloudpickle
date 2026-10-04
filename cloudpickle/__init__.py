@@ -1,5 +1,7 @@
 from . import cloudpickle
 from .cloudpickle import *  # noqa
+from .bundle import *  # noqa
+from . import bundle  # noqa
 
 __doc__ = cloudpickle.__doc__
 
@@ -16,3 +18,4 @@ __all__ = [  # noqa
     "register_pickle_by_value",
     "unregister_pickle_by_value",
 ]
+__all__ += bundle.__all__
